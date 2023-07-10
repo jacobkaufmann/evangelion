@@ -1,0 +1,20 @@
+[package]
+name = "dark-builder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+futures-util = "0.3.28"
+reth-interfaces = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-interfaces" }
+reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-payload-builder" }
+reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-primitives" }
+reth-provider = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-provider" }
+reth-revm = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm" }
+reth-revm-primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm-primitives" }
+tokio = "1.29.1"
+tokio-util = { version = "0.7.8", features = ["time"] }
+
+[patch.crates-io]
+ruint = { git = "https://github.com/paradigmxyz/uint" }
+revm = { git = "https://github.com/bluealloy/revm/", branch = "release/v25" }
+revm-primitives = { git = "https://github.com/bluealloy/revm/", branch = "release/v25" }
