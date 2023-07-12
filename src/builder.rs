@@ -109,7 +109,7 @@ pub struct Job<Client> {
     client: Arc<Client>,
     bundles: HashMap<BundleId, BundleCompact>,
     incoming: broadcast::Receiver<(BundleId, BlockNumber, BundleCompact)>,
-    expirations: broadcast::Receiver<BundleId>,
+    invalidated: broadcast::Receiver<BundleId>,
     built_payloads: Vec<Payload>,
     pending_payloads: VecDeque<oneshot::Receiver<Result<Payload, PayloadBuilderError>>>,
 }
@@ -120,7 +120,7 @@ impl<Client> Job<Client> {
         client: Arc<Client>,
         bundles: I,
         incoming: broadcast::Receiver<(BundleId, BlockNumber, BundleCompact)>,
-        expirations: broadcast::Receiver<BundleId>,
+        invalidated: broadcast::Receiver<BundleId>,
     ) -> Self {
         let bundles = bundles
             .map(|bundle| (bundle.id, BundleCompact(bundle.txs)))
@@ -132,7 +132,7 @@ impl<Client> Job<Client> {
             config,
             client,
             bundles,
-            expirations,
+            invalidated,
             incoming,
             built_payloads,
             pending_payloads,
@@ -311,13 +311,13 @@ where
             num_incoming_bundles += 1;
         }
 
-        // remove any expired bundles
+        // remove any invalidated bundles
         //
         // TODO: handle `TryRecvError::Lagged`
         let mut expired_bundles = HashSet::new();
-        let expirations = this.expirations.recv();
-        tokio::pin!(expirations);
-        while let Poll::Ready(Ok(exp)) = expirations.as_mut().poll(cx) {
+        let invalidated = this.invalidated.recv();
+        tokio::pin!(invalidated);
+        while let Poll::Ready(Ok(exp)) = invalidated.as_mut().poll(cx) {
             this.bundles.remove(&exp);
             expired_bundles.insert(exp);
         }
@@ -466,7 +466,7 @@ pub struct Builder<Client> {
     extra_data: u128,
     darkpool: Arc<Mutex<BundlePool>>,
     incoming: broadcast::Sender<(BundleId, BlockNumber, BundleCompact)>,
-    expirations: broadcast::Sender<BundleId>,
+    invalidated: broadcast::Sender<BundleId>,
 }
 
 impl<Client> Builder<Client>
@@ -477,7 +477,7 @@ where
         let chain = Arc::new(chain);
         let client = Arc::new(client);
         let (incoming, _) = broadcast::channel(256);
-        let (expirations, _) = broadcast::channel(256);
+        let (invalidated, _) = broadcast::channel(256);
 
         let darkpool = BundlePool::default();
         let darkpool = Arc::new(Mutex::new(darkpool));
@@ -488,7 +488,7 @@ where
             extra_data,
             darkpool,
             incoming,
-            expirations,
+            invalidated,
         }
     }
 
@@ -499,7 +499,7 @@ where
         mut state_events: mpsc::UnboundedReceiver<CanonStateNotification>,
     ) {
         let darkpool = Arc::clone(&self.darkpool);
-        let expirations = self.expirations.clone();
+        let invalidated = self.invalidated.clone();
         let incoming = self.incoming.clone();
 
         tokio::spawn(async move {
@@ -537,7 +537,7 @@ where
                     }
                     Some(expired) = bundle_expirations.next() => {
                         // notify jobs about expired bundle
-                        let _ = expirations.send(expired.into_inner());
+                        let _ = invalidated.send(expired.into_inner());
                     }
                     Some(event) = state_events.recv() => {
                         darkpool.lock().unwrap().maintain(event);
@@ -589,14 +589,14 @@ where
             .eligible(config.parent.number, SystemTime::now());
 
         let incoming = self.incoming.subscribe();
-        let expirations = self.expirations.subscribe();
+        let invalidated = self.invalidated.subscribe();
 
         Ok(Job::new(
             config,
             Arc::clone(&self.client),
             bundles.into_iter(),
             incoming,
-            expirations,
+            invalidated,
         ))
     }
 }
