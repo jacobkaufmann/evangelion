@@ -202,7 +202,7 @@ where
                 // within a bundle fails, we don't have to fail the entire payload.
                 let ResultAndState { result, state } = evm
                     .transact()
-                    .map_err(|err| PayloadBuilderError::EvmExecutionError(err))?;
+                    .map_err(PayloadBuilderError::EvmExecutionError)?;
 
                 commit_state_changes(&mut db, &mut post_state, block_num, state, true);
 
@@ -332,7 +332,7 @@ where
             // previously selected bundles. you could do far more sophisticated things here.
             let mut bundles: Vec<(BundleId, BundleCompact)> = vec![];
             for (id, bundle) in &this.bundles {
-                if !bundles.iter().any(|(_, b)| b.conflicts(&bundle)) {
+                if !bundles.iter().any(|(_, b)| b.conflicts(bundle)) {
                     bundles.push((*id, bundle.clone()));
                 }
             }
@@ -399,7 +399,7 @@ impl Future for PayloadTask {
 
         let mut empty = this.empty_payload.take().unwrap();
         match empty.poll_unpin(cx) {
-            Poll::Ready(Ok(res)) => Poll::Ready(res.and_then(|p| Ok(p.inner))),
+            Poll::Ready(Ok(res)) => Poll::Ready(res.map(|p| p.inner)),
             Poll::Ready(Err(err)) => Poll::Ready(Err(err.into())),
             Poll::Pending => {
                 this.empty_payload = Some(empty);
@@ -430,10 +430,7 @@ where
     }
 
     fn resolve(&mut self) -> (Self::ResolvePayloadFuture, KeepPayloadJobAlive) {
-        let best_payload = self
-            .built_payloads
-            .first()
-            .and_then(|p| Some(p.inner.clone()));
+        let best_payload = self.built_payloads.first().map(|p| p.inner.clone());
 
         // if there is no best payload, then build an empty payload
         let empty_payload = if best_payload.is_none() {
