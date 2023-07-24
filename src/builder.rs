@@ -179,11 +179,13 @@ where
         let mut bundle_ids = HashSet::new();
 
         for (id, bundle) in bundles {
-            // check gas
+            // check gas for entire bundle
+            let bundle_gas_limit: u64 = bundle.0.iter().map(|tx| tx.gas_limit()).sum();
+            if cumulative_gas_used + bundle_gas_limit > block_gas_limit {
+                continue;
+            }
 
             for tx in bundle.0.into_iter() {
-                // check gas
-
                 let tx = tx.into_ecrecovered().ok_or(PayloadBuilderError::Internal(
                     RethError::Custom("unable to recover tx signer".into()),
                 ))?;
