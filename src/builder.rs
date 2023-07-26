@@ -463,7 +463,7 @@ pub struct Builder<Client> {
     chain: Arc<ChainSpec>,
     client: Arc<Client>,
     extra_data: u128,
-    darkpool: Arc<Mutex<BundlePool>>,
+    bundle_pool: Arc<Mutex<BundlePool>>,
     incoming: broadcast::Sender<(BundleId, BlockNumber, BundleCompact)>,
     invalidated: broadcast::Sender<BundleId>,
 }
@@ -478,14 +478,14 @@ where
         let (incoming, _) = broadcast::channel(256);
         let (invalidated, _) = broadcast::channel(256);
 
-        let darkpool = BundlePool::default();
-        let darkpool = Arc::new(Mutex::new(darkpool));
+        let bundle_pool = BundlePool::default();
+        let bundle_pool = Arc::new(Mutex::new(bundle_pool));
 
         Self {
             chain,
             client,
             extra_data,
-            darkpool,
+            bundle_pool,
             incoming,
             invalidated,
         }
@@ -497,7 +497,7 @@ where
         mut bundle_flow: mpsc::UnboundedReceiver<Bundle>,
         mut state_events: mpsc::UnboundedReceiver<CanonStateNotification>,
     ) {
-        let darkpool = Arc::clone(&self.darkpool);
+        let bundle_pool = Arc::clone(&self.bundle_pool);
         let invalidated = self.invalidated.clone();
         let incoming = self.incoming.clone();
 
@@ -511,7 +511,7 @@ where
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        darkpool.lock().unwrap().tick(SystemTime::now());
+                        bundle_pool.lock().unwrap().tick(SystemTime::now());
                     }
                     Some(bundle) = bundle_flow.recv() => {
                         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -525,7 +525,7 @@ where
                         let timeout = Duration::from_secs(bundle.eligibility.end() - now);
                         bundle_expirations.insert(bundle.id, timeout);
 
-                        darkpool.lock().unwrap().0.insert(bundle.clone());
+                        bundle_pool.lock().unwrap().0.insert(bundle.clone());
 
                         // notify jobs about new bundle
                         //
@@ -539,7 +539,7 @@ where
                         let _ = invalidated.send(expired.into_inner());
                     }
                     Some(event) = state_events.recv() => {
-                        darkpool.lock().unwrap().maintain(event);
+                        bundle_pool.lock().unwrap().maintain(event);
                     }
                 }
             }
@@ -582,7 +582,7 @@ where
         //
         // NOTE: it may make more sense to use `attributes.timestamp` here in call to `eligible`
         let bundles = self
-            .darkpool
+            .bundle_pool
             .lock()
             .unwrap()
             .eligible(config.parent.number, SystemTime::now());
