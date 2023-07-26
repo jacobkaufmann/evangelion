@@ -563,21 +563,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dark-builder"
-version = "0.1.0"
-dependencies = [
- "futures-util",
- "reth-interfaces",
- "reth-payload-builder",
- "reth-primitives",
- "reth-provider",
- "reth-revm",
- "reth-revm-primitives",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "darling"
 version = "0.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -846,6 +831,21 @@ dependencies = [
  "thiserror",
  "tiny-keccak",
  "unicode-xid",
+]
+
+[[package]]
+name = "evangelion"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "reth-interfaces",
+ "reth-payload-builder",
+ "reth-primitives",
+ "reth-provider",
+ "reth-revm",
+ "reth-revm-primitives",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
