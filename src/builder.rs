@@ -14,7 +14,8 @@ use reth_payload_builder::{
 };
 use reth_primitives::{
     constants::{BEACON_NONCE, EMPTY_OMMER_ROOT},
-    proofs, Block, BlockNumber, ChainSpec, Header, Receipt, SealedHeader, TransactionSigned, U256,
+    proofs, Block, BlockNumber, ChainSpec, Header, Receipt, SealedHeader,
+    TransactionSignedEcRecovered, U256,
 };
 use reth_provider::{BlockReaderIdExt, CanonStateNotification, PostState, StateProviderFactory};
 use reth_revm::{
@@ -34,7 +35,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::time::DelayQueue;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct BundleCompact(Vec<TransactionSigned>);
+pub struct BundleCompact(Vec<TransactionSignedEcRecovered>);
 
 impl BundleCompact {
     /// returns whether `self` conflicts with `other` in the sense that both cannot be executed
@@ -58,7 +59,7 @@ type BundleId = u64;
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Bundle {
     pub id: BundleId,
-    pub txs: Vec<TransactionSigned>,
+    pub txs: Vec<TransactionSignedEcRecovered>,
     pub block_num: BlockNumber,
     pub eligibility: RangeInclusive<u64>,
 }
@@ -186,10 +187,6 @@ where
             }
 
             for tx in bundle.0.into_iter() {
-                let tx = tx.into_ecrecovered().ok_or(PayloadBuilderError::Internal(
-                    RethError::Custom("unable to recover tx signer".into()),
-                ))?;
-
                 // construct EVM
                 let tx_env = tx_env_with_recovered(&tx);
                 let env = Env {
