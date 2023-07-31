@@ -30,7 +30,10 @@ use reth_revm::{
         EVM,
     },
 };
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::{
+    sync::{broadcast, mpsc, oneshot},
+    task,
+};
 use tokio_util::time::DelayQueue;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -341,7 +344,7 @@ where
 
             let (tx, rx) = oneshot::channel();
             let client = Arc::clone(&this.client);
-            tokio::spawn(async move {
+            task::spawn_blocking(move || {
                 // TODO: come back to this
                 Job::build(
                     config,
@@ -440,7 +443,7 @@ where
             let config = self.config.clone();
             let client = Arc::clone(&self.client);
             let bundles = self.bundles.clone().into_iter();
-            tokio::spawn(async move {
+            task::spawn_blocking(move || {
                 Job::build(config, client, CachedReads::default(), bundles, tx);
             });
 
