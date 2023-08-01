@@ -12,6 +12,7 @@ reth-provider = { git = "https://github.com/paradigmxyz/reth.git", package = "re
 reth-revm = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm" }
 reth-revm-primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm-primitives" }
 tokio = "1.29.1"
+tokio-stream = { version = "0.1.14", features = ["sync"] }
 tokio-util = { version = "0.7.8", features = ["time"] }
 
 [patch.crates-io]

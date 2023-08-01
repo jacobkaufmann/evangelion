@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{stream::Fuse, FutureExt, Stream, StreamExt};
 use reth_interfaces::Error as RethError;
 use reth_payload_builder::{
     database::CachedReads, error::PayloadBuilderError, BuiltPayload, KeepPayloadJobAlive,
@@ -34,6 +34,7 @@ use tokio::{
     sync::{broadcast, mpsc, oneshot},
     task,
 };
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tokio_util::time::DelayQueue;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -111,8 +112,8 @@ pub struct Job<Client> {
     config: JobConfig,
     client: Arc<Client>,
     bundles: HashMap<BundleId, BundleCompact>,
-    incoming: broadcast::Receiver<(BundleId, BlockNumber, BundleCompact)>,
-    invalidated: broadcast::Receiver<BundleId>,
+    incoming: Fuse<BroadcastStream<(BundleId, BlockNumber, BundleCompact)>>,
+    invalidated: Fuse<BroadcastStream<BundleId>>,
     built_payloads: Vec<Payload>,
     pending_payloads: VecDeque<oneshot::Receiver<Result<Payload, PayloadBuilderError>>>,
 }
@@ -122,8 +123,8 @@ impl<Client> Job<Client> {
         config: JobConfig,
         client: Arc<Client>,
         bundles: I,
-        incoming: broadcast::Receiver<(BundleId, BlockNumber, BundleCompact)>,
-        invalidated: broadcast::Receiver<BundleId>,
+        incoming: Fuse<BroadcastStream<(BundleId, BlockNumber, BundleCompact)>>,
+        invalidated: Fuse<BroadcastStream<BundleId>>,
     ) -> Self {
         let bundles = bundles
             .map(|bundle| (bundle.id, BundleCompact(bundle.txs)))
@@ -301,30 +302,36 @@ where
         let this = self.get_mut();
 
         // incorporate new incoming bundles
-        //
-        // TODO: handle `TryRecvError::Lagged`
         let mut num_incoming_bundles = 0;
-        let incoming = this.incoming.recv();
-        tokio::pin!(incoming);
-        while let Poll::Ready(Ok((id, block_num, bundle))) = incoming.as_mut().poll(cx) {
-            // if the bundle is not eligible for the job, then skip the bundle
-            if block_num != this.config.parent.number + 1 {
-                continue;
-            }
+        let mut incoming = Pin::new(&mut this.incoming);
+        loop {
+            match incoming.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok((id, block_num, bundle)))) => {
+                    // if the bundle is not eligible for the job, then skip the bundle
+                    if block_num != this.config.parent.number + 1 {
+                        continue;
+                    }
 
-            this.bundles.insert(id, bundle);
-            num_incoming_bundles += 1;
+                    this.bundles.insert(id, bundle);
+                    num_incoming_bundles += 1;
+                }
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_skipped)))) => continue,
+                Poll::Ready(None) | Poll::Pending => break,
+            }
         }
 
         // remove any invalidated bundles
-        //
-        // TODO: handle `TryRecvError::Lagged`
         let mut expired_bundles = HashSet::new();
-        let invalidated = this.invalidated.recv();
-        tokio::pin!(invalidated);
-        while let Poll::Ready(Ok(exp)) = invalidated.as_mut().poll(cx) {
-            this.bundles.remove(&exp);
-            expired_bundles.insert(exp);
+        let mut invalidated = Pin::new(&mut this.invalidated);
+        loop {
+            match invalidated.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(exp))) => {
+                    this.bundles.remove(&exp);
+                    expired_bundles.insert(exp);
+                }
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_skipped)))) => continue,
+                Poll::Ready(None) | Poll::Pending => break,
+            }
         }
 
         // remove all payloads that contain an expired bundle
@@ -590,8 +597,8 @@ where
             .unwrap()
             .eligible(config.parent.number, SystemTime::now());
 
-        let incoming = self.incoming.subscribe();
-        let invalidated = self.invalidated.subscribe();
+        let incoming = BroadcastStream::new(self.incoming.subscribe()).fuse();
+        let invalidated = BroadcastStream::new(self.invalidated.subscribe()).fuse();
 
         Ok(Job::new(
             config,

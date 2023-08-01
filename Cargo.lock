@@ -845,6 +845,7 @@ dependencies = [
  "reth-revm",
  "reth-revm-primitives",
  "tokio",
+ "tokio-stream",
  "tokio-util",
 ]
 
