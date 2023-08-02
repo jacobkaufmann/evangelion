@@ -115,7 +115,7 @@ pub struct Job<Client> {
     incoming: Fuse<BroadcastStream<(BundleId, BlockNumber, BundleCompact)>>,
     invalidated: Fuse<BroadcastStream<BundleId>>,
     built_payloads: Vec<Payload>,
-    pending_payloads: VecDeque<oneshot::Receiver<Result<Payload, PayloadBuilderError>>>,
+    pending_payloads: VecDeque<task::JoinHandle<Result<Payload, PayloadBuilderError>>>,
 }
 
 impl<Client> Job<Client> {
@@ -149,16 +149,6 @@ where
     Client: StateProviderFactory,
 {
     fn build<I: Iterator<Item = (BundleId, BundleCompact)>>(
-        config: JobConfig,
-        client: Arc<Client>,
-        cached_reads: CachedReads,
-        bundles: I,
-        tx: oneshot::Sender<Result<Payload, PayloadBuilderError>>,
-    ) {
-        let _ = tx.send(Self::build_inner(config, client, cached_reads, bundles));
-    }
-
-    fn build_inner<I: Iterator<Item = (BundleId, BundleCompact)>>(
         config: JobConfig,
         client: Arc<Client>,
         mut cached_reads: CachedReads,
@@ -349,20 +339,13 @@ where
                 }
             }
 
-            let (tx, rx) = oneshot::channel();
             let client = Arc::clone(&this.client);
-            task::spawn_blocking(move || {
+            let pending = task::spawn_blocking(move || {
                 // TODO: come back to this
-                Job::build(
-                    config,
-                    client,
-                    CachedReads::default(),
-                    bundles.into_iter(),
-                    tx,
-                );
+                Job::build(config, client, CachedReads::default(), bundles.into_iter())
             });
 
-            this.pending_payloads.push_back(rx);
+            this.pending_payloads.push_back(pending);
         }
 
         // poll all pending payloads
@@ -432,7 +415,7 @@ where
             return Ok(Arc::clone(&best.inner));
         }
 
-        let empty = Job::build_inner(
+        let empty = Job::build(
             self.config.clone(),
             Arc::clone(&self.client),
             CachedReads::default(),
@@ -451,7 +434,8 @@ where
             let client = Arc::clone(&self.client);
             let bundles = self.bundles.clone().into_iter();
             task::spawn_blocking(move || {
-                Job::build(config, client, CachedReads::default(), bundles, tx);
+                let payload = Job::build(config, client, CachedReads::default(), bundles);
+                let _ = tx.send(payload);
             });
 
             Some(rx)
