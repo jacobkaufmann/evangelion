@@ -524,6 +524,8 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
 
             commit_state_changes(&mut db, &mut post_state, block_num, state, true);
 
+            cumulative_gas_used += result.gas_used();
+
             post_state.add_receipt(
                 block_num,
                 Receipt {
@@ -533,8 +535,6 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
                     logs: result.logs().into_iter().map(into_reth_log).collect(),
                 },
             );
-
-            cumulative_gas_used += result.gas_used();
 
             let miner_fee = tx
                 .effective_tip_per_gas(base_fee)
