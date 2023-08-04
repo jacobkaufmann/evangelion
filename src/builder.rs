@@ -543,8 +543,10 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
             total_fees += U256::from(miner_fee) * U256::from(result.gas_used());
 
             txs.push(tx.into_signed());
-            bundle_ids.insert(id);
         }
+
+        // add bundle to set of executed bundles
+        bundle_ids.insert(id);
     }
 
     // NOTE: here we assume post-shanghai
