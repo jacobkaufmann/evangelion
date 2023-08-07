@@ -527,6 +527,7 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
             continue;
         }
 
+        // add bundle to set of executed bundles
         bundle_ids.insert(id);
     }
 
