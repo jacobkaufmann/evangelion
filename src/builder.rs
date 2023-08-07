@@ -560,6 +560,7 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
     Ok(payload)
 }
 
+#[derive(Clone, Debug)]
 struct Execution {
     post_state: PostState,
     cumulative_gas_used: u64,
@@ -574,7 +575,8 @@ fn execute<DB, I>(
     txs: I,
 ) -> Result<Execution, PayloadBuilderError>
 where
-    DB: DatabaseRef<Error = RethError>,
+    DB: DatabaseRef,
+    <DB as DatabaseRef>::Error: std::fmt::Debug,
     I: Iterator<Item = TransactionSigned>,
 {
     let base_fee = block_env.basefee.to::<u64>();
@@ -601,9 +603,12 @@ where
         evm.database(&mut *db);
 
         // execute transaction
+        //
+        // TODO: add bound to DB error associated type so that we can use "?". for ease of testing
+        // with `revm::db::EmptyDB`, we currently do not have the bound.
         let ResultAndState { result, state } = evm
             .transact()
-            .map_err(PayloadBuilderError::EvmExecutionError)?;
+            .map_err(|err| PayloadBuilderError::Internal(RethError::Custom(format!("{err:?}"))))?;
 
         // commit changes to DB and post state
         commit_state_changes(db, &mut post_state, block_num, state, true);
@@ -681,4 +686,126 @@ fn package_block<S: StateProvider>(
         withdrawals: Some(attributes.withdrawals.clone()),
     };
     Ok(block.seal_slow())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ethers::{
+        signers::{LocalWallet, Signer},
+        types::{transaction::eip2718::TypedTransaction, Eip1559TransactionRequest},
+    };
+    use reth_primitives::{Address, Bytes, TxType};
+    use reth_revm::revm::{
+        db::EmptyDB,
+        primitives::{specification::SpecId, state::AccountInfo, B256},
+    };
+
+    #[test]
+    fn execute_transfer() {
+        let mut db = CacheDB::new(EmptyDB());
+
+        // builder will be the coinbase (i.e. beneficiary)
+        let builder_wallet = LocalWallet::new(&mut rand::thread_rng());
+
+        let cfg_env = CfgEnv {
+            chain_id: U256::from(1),
+            spec_id: SpecId::CANCUN,
+            ..Default::default()
+        };
+        let block_env = BlockEnv {
+            number: U256::ZERO,
+            coinbase: builder_wallet.address().into(),
+            timestamp: U256::ZERO,
+            difficulty: U256::ZERO,
+            prevrandao: Some(B256::random()),
+            basefee: U256::ZERO,
+            gas_limit: U256::from(15000000),
+        };
+
+        let sender_wallet = LocalWallet::new(&mut rand::thread_rng());
+        let initial_sender_balance = 10000000;
+        let sender_nonce = 0;
+
+        // populate sender account in the DB
+        db.insert_account_info(
+            sender_wallet.address().into(),
+            AccountInfo {
+                balance: U256::from(initial_sender_balance),
+                nonce: sender_nonce,
+                code_hash: B256::zero(),
+                code: None,
+            },
+        );
+
+        let receiver_wallet = LocalWallet::new(&mut rand::thread_rng());
+        let transfer_amount = 100;
+        let tx_gas_limit = 21000;
+        let max_priority_fee = 100;
+        let max_fee = block_env.basefee.to::<u64>() + max_priority_fee;
+
+        // construct the transfer transaction for execution
+        let tx = Eip1559TransactionRequest::new()
+            .from(sender_wallet.address())
+            .to(receiver_wallet.address())
+            .gas(tx_gas_limit)
+            .max_fee_per_gas(max_fee)
+            .max_priority_fee_per_gas(max_priority_fee)
+            .value(transfer_amount)
+            .data(ethers::types::Bytes::default())
+            .access_list(ethers::types::transaction::eip2930::AccessList::default())
+            .nonce(sender_nonce)
+            .chain_id(cfg_env.chain_id.to::<u64>());
+        let tx = TypedTransaction::Eip1559(tx);
+        let signature = sender_wallet
+            .sign_transaction_sync(&tx)
+            .expect("can sign tx");
+        let tx_encoded = tx.rlp_signed(&signature);
+        let tx = TransactionSigned::decode_enveloped(Bytes::from(tx_encoded.as_ref()))
+            .expect("can decode tx");
+
+        let execution = execute(&mut db, &cfg_env, &block_env, 0, vec![tx].into_iter())
+            .expect("execution doesn't fail");
+        let Execution {
+            post_state,
+            cumulative_gas_used,
+            total_fees,
+        } = execution;
+
+        // expected gas usage is the transfer transaction's gas limit
+        let expected_cumulative_gas_used = tx_gas_limit;
+
+        // check post state contains transaction receipt
+        let receipt = post_state
+            .receipts(block_env.number.to::<u64>())
+            .first()
+            .expect("post state contains receipt");
+        assert!(receipt.success);
+        assert_eq!(receipt.tx_type, TxType::EIP1559);
+        assert_eq!(receipt.cumulative_gas_used, expected_cumulative_gas_used);
+
+        // check post-execution sender balance
+        let sender_account = post_state
+            .account(&Address::from(sender_wallet.address()))
+            .expect("sender account touched")
+            .expect("sender account not destroyed");
+        let expected_sender_balance =
+            initial_sender_balance - transfer_amount - (max_fee * tx_gas_limit);
+        assert_eq!(sender_account.balance, U256::from(expected_sender_balance));
+
+        // check post-execution receiver balance
+        let receiver_account = post_state
+            .account(&Address::from(receiver_wallet.address()))
+            .expect("receiver account touched")
+            .expect("receiver account not destroyed");
+        assert_eq!(receiver_account.balance, U256::from(transfer_amount));
+
+        // check gas usage
+        assert_eq!(cumulative_gas_used, expected_cumulative_gas_used);
+
+        // check fees
+        let expected_total_fees = tx_gas_limit * max_priority_fee;
+        assert_eq!(total_fees, U256::from(expected_total_fees));
+    }
 }

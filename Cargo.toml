@@ -18,3 +18,7 @@ tokio-util = { version = "0.7.8", features = ["time"] }
 [patch.crates-io]
 revm = { git = "https://github.com/bluealloy/revm/", branch = "release/v25" }
 revm-primitives = { git = "https://github.com/bluealloy/revm/", branch = "release/v25" }
+
+[dev-dependencies]
+ethers = "2.0.8"
+rand = "0.8.5"
