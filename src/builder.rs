@@ -501,6 +501,9 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
         // clone the database, so that if the execution fails, then we can keep the state of the
         // database as if the execution was never attempted. currently, there is no way to roll
         // back the database state if the execution fails part-way through.
+        //
+        // NOTE: we will be able to refactor to do rollbacks after the following is merged:
+        // https://github.com/paradigmxyz/reth/pull/3512
         let mut tmp_db = db.clone();
 
         let mut bundle = bundle.0;
@@ -539,7 +542,8 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
 
     let block = package_block(
         state.state(),
-        &config,
+        &config.attributes,
+        config.extra_data,
         &block_env,
         txs,
         post_state,
@@ -631,7 +635,8 @@ where
 
 fn package_block<S: StateProvider>(
     state: S,
-    config: &JobConfig,
+    attributes: &PayloadBuilderAttributes,
+    extra_data: u128,
     block_env: &BlockEnv,
     txs: Vec<TransactionSigned>,
     post_state: PostState,
@@ -645,11 +650,11 @@ fn package_block<S: StateProvider>(
     let receipts_root = post_state.receipts_root(block_num);
     let logs_bloom = post_state.logs_bloom(block_num);
     let transactions_root = proofs::calculate_transaction_root(&txs);
-    let withdrawals_root = proofs::calculate_withdrawals_root(&config.attributes.withdrawals);
+    let withdrawals_root = proofs::calculate_withdrawals_root(&attributes.withdrawals);
     let state_root = state.state_root(post_state)?;
 
     let header = Header {
-        parent_hash: config.parent.hash,
+        parent_hash: attributes.parent,
         ommers_hash: EMPTY_OMMER_ROOT,
         beneficiary: block_env.coinbase,
         state_root,
@@ -657,22 +662,22 @@ fn package_block<S: StateProvider>(
         receipts_root,
         withdrawals_root: Some(withdrawals_root),
         logs_bloom,
-        timestamp: config.attributes.timestamp,
-        mix_hash: config.attributes.prev_randao,
+        timestamp: attributes.timestamp,
+        mix_hash: attributes.prev_randao,
         nonce: BEACON_NONCE,
         base_fee_per_gas: Some(base_fee),
         number: block_num,
         gas_limit: block_gas_limit,
         difficulty: U256::ZERO,
         gas_used: cumulative_gas_used,
-        extra_data: config.extra_data.to_le_bytes().into(),
+        extra_data: extra_data.to_le_bytes().into(),
     };
 
     let block = Block {
         header,
         body: txs,
         ommers: vec![],
-        withdrawals: Some(config.attributes.withdrawals.clone()),
+        withdrawals: Some(attributes.withdrawals.clone()),
     };
     Ok(block.seal_slow())
 }
