@@ -6,18 +6,20 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{stream::Fuse, FutureExt, Stream, StreamExt};
 use reth_interfaces::Error as RethError;
 use reth_payload_builder::{
-    database::CachedReads, error::PayloadBuilderError, BuiltPayload, KeepPayloadJobAlive,
-    PayloadBuilderAttributes, PayloadJob, PayloadJobGenerator,
+    error::PayloadBuilderError, BuiltPayload, KeepPayloadJobAlive, PayloadBuilderAttributes,
+    PayloadJob, PayloadJobGenerator,
 };
 use reth_primitives::{
     constants::{BEACON_NONCE, EMPTY_OMMER_ROOT},
-    proofs, Block, BlockNumber, ChainSpec, Header, Receipt, SealedHeader,
-    TransactionSignedEcRecovered, U256,
+    proofs, Block, BlockNumber, ChainSpec, Header, Receipt, SealedBlock, SealedHeader,
+    TransactionSigned, TransactionSignedEcRecovered, U256,
 };
-use reth_provider::{BlockReaderIdExt, CanonStateNotification, PostState, StateProviderFactory};
+use reth_provider::{
+    BlockReaderIdExt, CanonStateNotification, PostState, StateProvider, StateProviderFactory,
+};
 use reth_revm::{
     database::State,
     env::tx_env_with_recovered,
@@ -26,12 +28,16 @@ use reth_revm::{
     },
     into_reth_log,
     revm::{
-        db::CacheDB,
-        primitives::{result::InvalidTransaction, Env, ResultAndState},
+        db::{CacheDB, DatabaseRef},
+        primitives::{result::InvalidTransaction, BlockEnv, CfgEnv, Env, ResultAndState},
         EVM,
     },
 };
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::{
+    sync::{broadcast, mpsc, oneshot},
+    task,
+};
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tokio_util::time::DelayQueue;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -109,10 +115,10 @@ pub struct Job<Client> {
     config: JobConfig,
     client: Arc<Client>,
     bundles: HashMap<BundleId, BundleCompact>,
-    incoming: broadcast::Receiver<(BundleId, BlockNumber, BundleCompact)>,
-    invalidated: broadcast::Receiver<BundleId>,
+    incoming: Fuse<BroadcastStream<(BundleId, BlockNumber, BundleCompact)>>,
+    invalidated: Fuse<BroadcastStream<BundleId>>,
     built_payloads: Vec<Payload>,
-    pending_payloads: VecDeque<oneshot::Receiver<Result<Payload, PayloadBuilderError>>>,
+    pending_payloads: VecDeque<task::JoinHandle<Result<Payload, PayloadBuilderError>>>,
 }
 
 impl<Client> Job<Client> {
@@ -120,8 +126,8 @@ impl<Client> Job<Client> {
         config: JobConfig,
         client: Arc<Client>,
         bundles: I,
-        incoming: broadcast::Receiver<(BundleId, BlockNumber, BundleCompact)>,
-        invalidated: broadcast::Receiver<BundleId>,
+        incoming: Fuse<BroadcastStream<(BundleId, BlockNumber, BundleCompact)>>,
+        invalidated: Fuse<BroadcastStream<BundleId>>,
     ) -> Self {
         let bundles = bundles
             .map(|bundle| (bundle.id, BundleCompact(bundle.txs)))
@@ -141,148 +147,6 @@ impl<Client> Job<Client> {
     }
 }
 
-impl<Client> Job<Client>
-where
-    Client: StateProviderFactory,
-{
-    fn build<I: Iterator<Item = (BundleId, BundleCompact)>>(
-        config: JobConfig,
-        client: Arc<Client>,
-        cached_reads: CachedReads,
-        bundles: I,
-        tx: oneshot::Sender<Result<Payload, PayloadBuilderError>>,
-    ) {
-        let _ = tx.send(Self::build_inner(config, client, cached_reads, bundles));
-    }
-
-    fn build_inner<I: Iterator<Item = (BundleId, BundleCompact)>>(
-        config: JobConfig,
-        client: Arc<Client>,
-        mut cached_reads: CachedReads,
-        bundles: I,
-    ) -> Result<Payload, PayloadBuilderError> {
-        // init state w.r.t. config
-        let state = State::new(client.state_by_block_hash(config.parent.hash)?);
-        let mut db = CacheDB::new(cached_reads.as_db(&state));
-        let mut post_state = PostState::default();
-
-        let (cfg_env, block_env) = config
-            .attributes
-            .cfg_and_block_env(&config.chain, &config.parent);
-
-        let base_fee = block_env.basefee.to::<u64>();
-        let block_num = block_env.number.to::<u64>();
-        let block_gas_limit: u64 = block_env.gas_limit.try_into().unwrap_or(u64::MAX);
-
-        let mut total_fees = U256::ZERO;
-        let mut cumulative_gas_used = 0;
-        let mut txs = Vec::new();
-        let mut bundle_ids = HashSet::new();
-
-        for (id, bundle) in bundles {
-            // check gas for entire bundle
-            let bundle_gas_limit: u64 = bundle.0.iter().map(|tx| tx.gas_limit()).sum();
-            if cumulative_gas_used + bundle_gas_limit > block_gas_limit {
-                continue;
-            }
-
-            for tx in bundle.0.into_iter() {
-                // construct EVM
-                let tx_env = tx_env_with_recovered(&tx);
-                let env = Env {
-                    cfg: cfg_env.clone(),
-                    block: block_env.clone(),
-                    tx: tx_env.clone(),
-                };
-                let mut evm = EVM::with_env(env);
-                evm.database(&mut db);
-
-                // NOTE: you can do far more reasonable error handling here. if a transaction
-                // within a bundle fails, we don't have to fail the entire payload.
-                let ResultAndState { result, state } = evm
-                    .transact()
-                    .map_err(PayloadBuilderError::EvmExecutionError)?;
-
-                commit_state_changes(&mut db, &mut post_state, block_num, state, true);
-
-                post_state.add_receipt(
-                    block_num,
-                    Receipt {
-                        tx_type: tx.tx_type(),
-                        success: result.is_success(),
-                        cumulative_gas_used,
-                        logs: result.logs().into_iter().map(into_reth_log).collect(),
-                    },
-                );
-
-                cumulative_gas_used += result.gas_used();
-
-                let miner_fee = tx
-                    .effective_tip_per_gas(base_fee)
-                    .ok_or(InvalidTransaction::GasPriceLessThanBasefee)
-                    .map_err(|err| PayloadBuilderError::EvmExecutionError(err.into()))?;
-                total_fees += U256::from(miner_fee) * U256::from(result.gas_used());
-
-                txs.push(tx.into_signed());
-                bundle_ids.insert(id);
-            }
-        }
-
-        // NOTE: here we assume post-shanghai
-        let balance_increments = post_block_withdrawals_balance_increments(
-            &config.chain,
-            config.attributes.timestamp,
-            &config.attributes.withdrawals,
-        );
-        for (address, increment) in balance_increments {
-            increment_account_balance(&mut db, &mut post_state, block_num, address, increment)?;
-        }
-        let withdrawals_root = proofs::calculate_withdrawals_root(&config.attributes.withdrawals);
-
-        // compute other accumulators
-        let receipts_root = post_state.receipts_root(block_num);
-        let logs_bloom = post_state.logs_bloom(block_num);
-        let transactions_root = proofs::calculate_transaction_root(&txs);
-        let state_root = state.state().state_root(post_state)?;
-
-        let header = Header {
-            parent_hash: config.parent.hash,
-            ommers_hash: EMPTY_OMMER_ROOT,
-            beneficiary: block_env.coinbase,
-            state_root,
-            transactions_root,
-            receipts_root,
-            withdrawals_root: Some(withdrawals_root),
-            logs_bloom,
-            timestamp: config.attributes.timestamp,
-            mix_hash: config.attributes.prev_randao,
-            nonce: BEACON_NONCE,
-            base_fee_per_gas: Some(base_fee),
-            number: config.parent.number + 1,
-            gas_limit: block_gas_limit,
-            difficulty: U256::ZERO,
-            gas_used: cumulative_gas_used,
-            extra_data: config.extra_data.to_le_bytes().into(),
-        };
-
-        let block = Block {
-            header,
-            body: txs,
-            ommers: vec![],
-            withdrawals: Some(config.attributes.withdrawals),
-        };
-        let block = block.seal_slow();
-
-        let payload = BuiltPayload::new(config.attributes.id, block, total_fees);
-        let payload = Payload {
-            inner: Arc::new(payload),
-            bundles: bundle_ids,
-        };
-
-        Ok(payload)
-    }
-}
-
 impl<Client> Future for Job<Client>
 where
     Client: StateProviderFactory + 'static,
@@ -295,30 +159,36 @@ where
         let this = self.get_mut();
 
         // incorporate new incoming bundles
-        //
-        // TODO: handle `TryRecvError::Lagged`
         let mut num_incoming_bundles = 0;
-        let incoming = this.incoming.recv();
-        tokio::pin!(incoming);
-        while let Poll::Ready(Ok((id, block_num, bundle))) = incoming.as_mut().poll(cx) {
-            // if the bundle is not eligible for the job, then skip the bundle
-            if block_num != this.config.parent.number + 1 {
-                continue;
-            }
+        let mut incoming = Pin::new(&mut this.incoming);
+        loop {
+            match incoming.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok((id, block_num, bundle)))) => {
+                    // if the bundle is not eligible for the job, then skip the bundle
+                    if block_num != this.config.parent.number + 1 {
+                        continue;
+                    }
 
-            this.bundles.insert(id, bundle);
-            num_incoming_bundles += 1;
+                    this.bundles.insert(id, bundle);
+                    num_incoming_bundles += 1;
+                }
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_skipped)))) => continue,
+                Poll::Ready(None) | Poll::Pending => break,
+            }
         }
 
         // remove any invalidated bundles
-        //
-        // TODO: handle `TryRecvError::Lagged`
         let mut expired_bundles = HashSet::new();
-        let invalidated = this.invalidated.recv();
-        tokio::pin!(invalidated);
-        while let Poll::Ready(Ok(exp)) = invalidated.as_mut().poll(cx) {
-            this.bundles.remove(&exp);
-            expired_bundles.insert(exp);
+        let mut invalidated = Pin::new(&mut this.invalidated);
+        loop {
+            match invalidated.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(exp))) => {
+                    this.bundles.remove(&exp);
+                    expired_bundles.insert(exp);
+                }
+                Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(_skipped)))) => continue,
+                Poll::Ready(None) | Poll::Pending => break,
+            }
         }
 
         // remove all payloads that contain an expired bundle
@@ -336,20 +206,13 @@ where
                 }
             }
 
-            let (tx, rx) = oneshot::channel();
             let client = Arc::clone(&this.client);
-            tokio::spawn(async move {
+            let pending = task::spawn_blocking(move || {
                 // TODO: come back to this
-                Job::build(
-                    config,
-                    client,
-                    CachedReads::default(),
-                    bundles.into_iter(),
-                    tx,
-                );
+                build(config, client, bundles.into_iter())
             });
 
-            this.pending_payloads.push_back(rx);
+            this.pending_payloads.push_back(pending);
         }
 
         // poll all pending payloads
@@ -419,10 +282,9 @@ where
             return Ok(Arc::clone(&best.inner));
         }
 
-        let empty = Job::build_inner(
+        let empty = build(
             self.config.clone(),
             Arc::clone(&self.client),
-            CachedReads::default(),
             self.bundles.clone().into_iter(),
         )?;
         Ok(empty.inner)
@@ -437,8 +299,9 @@ where
             let config = self.config.clone();
             let client = Arc::clone(&self.client);
             let bundles = self.bundles.clone().into_iter();
-            tokio::spawn(async move {
-                Job::build(config, client, CachedReads::default(), bundles, tx);
+            task::spawn_blocking(move || {
+                let payload = build(config, client, bundles);
+                let _ = tx.send(payload);
             });
 
             Some(rx)
@@ -460,7 +323,7 @@ pub struct Builder<Client> {
     chain: Arc<ChainSpec>,
     client: Arc<Client>,
     extra_data: u128,
-    darkpool: Arc<Mutex<BundlePool>>,
+    bundle_pool: Arc<Mutex<BundlePool>>,
     incoming: broadcast::Sender<(BundleId, BlockNumber, BundleCompact)>,
     invalidated: broadcast::Sender<BundleId>,
 }
@@ -475,14 +338,14 @@ where
         let (incoming, _) = broadcast::channel(256);
         let (invalidated, _) = broadcast::channel(256);
 
-        let darkpool = BundlePool::default();
-        let darkpool = Arc::new(Mutex::new(darkpool));
+        let bundle_pool = BundlePool::default();
+        let bundle_pool = Arc::new(Mutex::new(bundle_pool));
 
         Self {
             chain,
             client,
             extra_data,
-            darkpool,
+            bundle_pool,
             incoming,
             invalidated,
         }
@@ -494,7 +357,7 @@ where
         mut bundle_flow: mpsc::UnboundedReceiver<Bundle>,
         mut state_events: mpsc::UnboundedReceiver<CanonStateNotification>,
     ) {
-        let darkpool = Arc::clone(&self.darkpool);
+        let bundle_pool = Arc::clone(&self.bundle_pool);
         let invalidated = self.invalidated.clone();
         let incoming = self.incoming.clone();
 
@@ -508,7 +371,7 @@ where
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        darkpool.lock().unwrap().tick(SystemTime::now());
+                        bundle_pool.lock().unwrap().tick(SystemTime::now());
                     }
                     Some(bundle) = bundle_flow.recv() => {
                         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -522,7 +385,7 @@ where
                         let timeout = Duration::from_secs(bundle.eligibility.end() - now);
                         bundle_expirations.insert(bundle.id, timeout);
 
-                        darkpool.lock().unwrap().0.insert(bundle.clone());
+                        bundle_pool.lock().unwrap().0.insert(bundle.clone());
 
                         // notify jobs about new bundle
                         //
@@ -536,7 +399,7 @@ where
                         let _ = invalidated.send(expired.into_inner());
                     }
                     Some(event) = state_events.recv() => {
-                        darkpool.lock().unwrap().maintain(event);
+                        bundle_pool.lock().unwrap().maintain(event);
                     }
                 }
             }
@@ -579,13 +442,13 @@ where
         //
         // NOTE: it may make more sense to use `attributes.timestamp` here in call to `eligible`
         let bundles = self
-            .darkpool
+            .bundle_pool
             .lock()
             .unwrap()
             .eligible(config.parent.number, SystemTime::now());
 
-        let incoming = self.incoming.subscribe();
-        let invalidated = self.invalidated.subscribe();
+        let incoming = BroadcastStream::new(self.incoming.subscribe()).fuse();
+        let invalidated = BroadcastStream::new(self.invalidated.subscribe()).fuse();
 
         Ok(Job::new(
             config,
@@ -594,5 +457,350 @@ where
             incoming,
             invalidated,
         ))
+    }
+}
+
+fn build<Client: StateProviderFactory, I: Iterator<Item = (BundleId, BundleCompact)>>(
+    config: JobConfig,
+    client: Arc<Client>,
+    bundles: I,
+) -> Result<Payload, PayloadBuilderError> {
+    let state = client.state_by_block_hash(config.parent.hash)?;
+    let state = State::new(state);
+    build_on_state(config, state, bundles)
+}
+
+fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)>>(
+    config: JobConfig,
+    state: State<S>,
+    bundles: I,
+) -> Result<Payload, PayloadBuilderError> {
+    let state = Arc::new(state);
+    let mut db = CacheDB::new(Arc::clone(&state));
+
+    let mut post_state = PostState::default();
+
+    let (cfg_env, block_env) = config
+        .attributes
+        .cfg_and_block_env(&config.chain, &config.parent);
+    let block_num = block_env.number.to::<u64>();
+    let block_gas_limit: u64 = block_env.gas_limit.try_into().unwrap_or(u64::MAX);
+
+    let mut total_fees = U256::ZERO;
+    let mut cumulative_gas_used = 0;
+    let mut txs = Vec::new();
+    let mut bundle_ids = HashSet::new();
+
+    for (id, bundle) in bundles {
+        // check gas for entire bundle
+        let bundle_gas_limit: u64 = bundle.0.iter().map(|tx| tx.gas_limit()).sum();
+        if cumulative_gas_used + bundle_gas_limit > block_gas_limit {
+            continue;
+        }
+
+        // clone the database, so that if the execution fails, then we can keep the state of the
+        // database as if the execution was never attempted. currently, there is no way to roll
+        // back the database state if the execution fails part-way through.
+        //
+        // NOTE: we will be able to refactor to do rollbacks after the following is merged:
+        // https://github.com/paradigmxyz/reth/pull/3512
+        let mut tmp_db = db.clone();
+
+        let mut bundle = bundle.0;
+        let execution = execute(
+            &mut tmp_db,
+            &cfg_env,
+            &block_env,
+            cumulative_gas_used,
+            bundle.clone().into_iter(),
+        );
+
+        if let Ok(execution) = execution {
+            total_fees += execution.total_fees;
+            cumulative_gas_used = execution.cumulative_gas_used;
+
+            txs.append(&mut bundle);
+            post_state.extend(execution.post_state);
+
+            db = tmp_db;
+        } else {
+            continue;
+        }
+
+        // add bundle to set of executed bundles
+        bundle_ids.insert(id);
+    }
+
+    // NOTE: here we assume post-shanghai
+    let balance_increments = post_block_withdrawals_balance_increments(
+        &config.chain,
+        config.attributes.timestamp,
+        &config.attributes.withdrawals,
+    );
+    for (address, increment) in balance_increments {
+        increment_account_balance(&mut db, &mut post_state, block_num, address, increment)?;
+    }
+
+    let block = package_block(
+        state.state(),
+        &config.attributes,
+        config.extra_data,
+        &block_env,
+        txs.into_iter().map(|tx| tx.into_signed()).collect(),
+        post_state,
+        cumulative_gas_used,
+    )?;
+
+    let payload = BuiltPayload::new(config.attributes.id, block, total_fees);
+    let payload = Payload {
+        inner: Arc::new(payload),
+        bundles: bundle_ids,
+    };
+
+    Ok(payload)
+}
+
+#[derive(Clone, Debug)]
+struct Execution {
+    post_state: PostState,
+    cumulative_gas_used: u64,
+    total_fees: U256,
+}
+
+fn execute<DB, I>(
+    db: &mut CacheDB<DB>,
+    cfg_env: &CfgEnv,
+    block_env: &BlockEnv,
+    mut cumulative_gas_used: u64,
+    txs: I,
+) -> Result<Execution, PayloadBuilderError>
+where
+    DB: DatabaseRef,
+    <DB as DatabaseRef>::Error: std::fmt::Debug,
+    I: Iterator<Item = TransactionSignedEcRecovered>,
+{
+    let base_fee = block_env.basefee.to::<u64>();
+    let block_num = block_env.number.to::<u64>();
+
+    let mut total_fees = U256::ZERO;
+    let mut post_state = PostState::default();
+
+    for tx in txs {
+        // construct EVM
+        let tx_env = tx_env_with_recovered(&tx);
+        let env = Env {
+            cfg: cfg_env.clone(),
+            block: block_env.clone(),
+            tx: tx_env.clone(),
+        };
+        let mut evm = EVM::with_env(env);
+        evm.database(&mut *db);
+
+        // execute transaction
+        //
+        // TODO: add bound to DB error associated type so that we can use "?". for ease of testing
+        // with `revm::db::EmptyDB`, we currently do not have the bound.
+        let ResultAndState { result, state } = evm
+            .transact()
+            .map_err(|err| PayloadBuilderError::Internal(RethError::Custom(format!("{err:?}"))))?;
+
+        // commit changes to DB and post state
+        commit_state_changes(db, &mut post_state, block_num, state, true);
+
+        cumulative_gas_used += result.gas_used();
+
+        post_state.add_receipt(
+            block_num,
+            Receipt {
+                tx_type: tx.tx_type(),
+                success: result.is_success(),
+                cumulative_gas_used,
+                logs: result.logs().into_iter().map(into_reth_log).collect(),
+            },
+        );
+
+        let miner_fee = tx
+            .effective_tip_per_gas(base_fee)
+            .ok_or(InvalidTransaction::GasPriceLessThanBasefee)
+            .map_err(|err| PayloadBuilderError::EvmExecutionError(err.into()))?;
+        total_fees += U256::from(miner_fee) * U256::from(result.gas_used());
+    }
+
+    Ok(Execution {
+        post_state,
+        cumulative_gas_used,
+        total_fees,
+    })
+}
+
+fn package_block<S: StateProvider>(
+    state: S,
+    attributes: &PayloadBuilderAttributes,
+    extra_data: u128,
+    block_env: &BlockEnv,
+    txs: Vec<TransactionSigned>,
+    post_state: PostState,
+    cumulative_gas_used: u64,
+) -> Result<SealedBlock, PayloadBuilderError> {
+    let base_fee = block_env.basefee.to::<u64>();
+    let block_num = block_env.number.to::<u64>();
+    let block_gas_limit: u64 = block_env.gas_limit.try_into().unwrap_or(u64::MAX);
+
+    // compute accumulators
+    let receipts_root = post_state.receipts_root(block_num);
+    let logs_bloom = post_state.logs_bloom(block_num);
+    let transactions_root = proofs::calculate_transaction_root(&txs);
+    let withdrawals_root = proofs::calculate_withdrawals_root(&attributes.withdrawals);
+    let state_root = state.state_root(post_state)?;
+
+    let header = Header {
+        parent_hash: attributes.parent,
+        ommers_hash: EMPTY_OMMER_ROOT,
+        beneficiary: block_env.coinbase,
+        state_root,
+        transactions_root,
+        receipts_root,
+        withdrawals_root: Some(withdrawals_root),
+        logs_bloom,
+        timestamp: attributes.timestamp,
+        mix_hash: attributes.prev_randao,
+        nonce: BEACON_NONCE,
+        base_fee_per_gas: Some(base_fee),
+        number: block_num,
+        gas_limit: block_gas_limit,
+        difficulty: U256::ZERO,
+        gas_used: cumulative_gas_used,
+        extra_data: extra_data.to_le_bytes().into(),
+    };
+
+    let block = Block {
+        header,
+        body: txs,
+        ommers: vec![],
+        withdrawals: Some(attributes.withdrawals.clone()),
+    };
+    Ok(block.seal_slow())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ethers::{
+        signers::{LocalWallet, Signer},
+        types::{transaction::eip2718::TypedTransaction, Eip1559TransactionRequest},
+    };
+    use reth_primitives::{Address, Bytes, TxType};
+    use reth_revm::revm::{
+        db::EmptyDB,
+        primitives::{specification::SpecId, state::AccountInfo, B256},
+    };
+
+    #[test]
+    fn execute_transfer() {
+        let mut db = CacheDB::new(EmptyDB());
+
+        // builder will be the coinbase (i.e. beneficiary)
+        let builder_wallet = LocalWallet::new(&mut rand::thread_rng());
+
+        let cfg_env = CfgEnv {
+            chain_id: U256::from(1),
+            spec_id: SpecId::CANCUN,
+            ..Default::default()
+        };
+        let block_env = BlockEnv {
+            number: U256::ZERO,
+            coinbase: builder_wallet.address().into(),
+            timestamp: U256::ZERO,
+            difficulty: U256::ZERO,
+            prevrandao: Some(B256::random()),
+            basefee: U256::ZERO,
+            gas_limit: U256::from(15000000),
+        };
+
+        let sender_wallet = LocalWallet::new(&mut rand::thread_rng());
+        let initial_sender_balance = 10000000;
+        let sender_nonce = 0;
+
+        // populate sender account in the DB
+        db.insert_account_info(
+            sender_wallet.address().into(),
+            AccountInfo {
+                balance: U256::from(initial_sender_balance),
+                nonce: sender_nonce,
+                code_hash: B256::zero(),
+                code: None,
+            },
+        );
+
+        let receiver_wallet = LocalWallet::new(&mut rand::thread_rng());
+        let transfer_amount = 100;
+        let tx_gas_limit = 21000;
+        let max_priority_fee = 100;
+        let max_fee = block_env.basefee.to::<u64>() + max_priority_fee;
+
+        // construct the transfer transaction for execution
+        let tx = Eip1559TransactionRequest::new()
+            .from(sender_wallet.address())
+            .to(receiver_wallet.address())
+            .gas(tx_gas_limit)
+            .max_fee_per_gas(max_fee)
+            .max_priority_fee_per_gas(max_priority_fee)
+            .value(transfer_amount)
+            .data(ethers::types::Bytes::default())
+            .access_list(ethers::types::transaction::eip2930::AccessList::default())
+            .nonce(sender_nonce)
+            .chain_id(cfg_env.chain_id.to::<u64>());
+        let tx = TypedTransaction::Eip1559(tx);
+        let signature = sender_wallet
+            .sign_transaction_sync(&tx)
+            .expect("can sign tx");
+        let tx_encoded = tx.rlp_signed(&signature);
+        let tx = TransactionSigned::decode_enveloped(Bytes::from(tx_encoded.as_ref()))
+            .expect("can decode tx");
+        let tx = tx.into_ecrecovered().expect("can recover tx signer");
+
+        let execution = execute(&mut db, &cfg_env, &block_env, 0, vec![tx].into_iter())
+            .expect("execution doesn't fail");
+        let Execution {
+            post_state,
+            cumulative_gas_used,
+            total_fees,
+        } = execution;
+
+        // expected gas usage is the transfer transaction's gas limit
+        let expected_cumulative_gas_used = tx_gas_limit;
+
+        // check post state contains transaction receipt
+        let receipt = post_state
+            .receipts(block_env.number.to::<u64>())
+            .first()
+            .expect("post state contains receipt");
+        assert!(receipt.success);
+        assert_eq!(receipt.tx_type, TxType::EIP1559);
+        assert_eq!(receipt.cumulative_gas_used, expected_cumulative_gas_used);
+
+        // check post-execution sender balance
+        let sender_account = post_state
+            .account(&Address::from(sender_wallet.address()))
+            .expect("sender account touched")
+            .expect("sender account not destroyed");
+        let expected_sender_balance =
+            initial_sender_balance - transfer_amount - (max_fee * tx_gas_limit);
+        assert_eq!(sender_account.balance, U256::from(expected_sender_balance));
+
+        // check post-execution receiver balance
+        let receiver_account = post_state
+            .account(&Address::from(receiver_wallet.address()))
+            .expect("receiver account touched")
+            .expect("receiver account not destroyed");
+        assert_eq!(receiver_account.balance, U256::from(transfer_amount));
+
+        // check gas usage
+        assert_eq!(cumulative_gas_used, expected_cumulative_gas_used);
+
+        // check fees
+        let expected_total_fees = tx_gas_limit * max_priority_fee;
+        assert_eq!(total_fees, U256::from(expected_total_fees));
     }
 }

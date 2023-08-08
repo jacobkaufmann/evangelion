@@ -1,5 +1,5 @@
 [package]
-name = "dark-builder"
+name = "evangelion"
 version = "0.1.0"
 edition = "2021"
 
@@ -12,9 +12,13 @@ reth-provider = { git = "https://github.com/paradigmxyz/reth.git", package = "re
 reth-revm = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm" }
 reth-revm-primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm-primitives" }
 tokio = "1.29.1"
+tokio-stream = { version = "0.1.14", features = ["sync"] }
 tokio-util = { version = "0.7.8", features = ["time"] }
 
 [patch.crates-io]
-ruint = { git = "https://github.com/paradigmxyz/uint" }
 revm = { git = "https://github.com/bluealloy/revm/", branch = "release/v25" }
 revm-primitives = { git = "https://github.com/bluealloy/revm/", branch = "release/v25" }
+
+[dev-dependencies]
+ethers = "2.0.8"
+rand = "0.8.5"

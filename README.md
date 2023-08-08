@@ -1,3 +1,3 @@
-# dark-builder
+# evangelion
 
-a prototype for a block builder with "dark" order flow
+a prototype block builder for ethereum
