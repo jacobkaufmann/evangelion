@@ -14,13 +14,14 @@ use reth_payload_builder::{
 };
 use reth_primitives::{
     constants::{BEACON_NONCE, EMPTY_OMMER_ROOT},
-    proofs, Block, BlockNumber, ChainSpec, Header, Receipt, SealedBlock, SealedHeader,
-    TransactionSigned, U256,
+    proofs, AccessList, Address, Block, BlockNumber, ChainSpec, Header, Receipt, SealedBlock,
+    SealedHeader, TransactionSigned, U256,
 };
 use reth_provider::{
     BlockReaderIdExt, CanonStateNotification, PostState, StateProvider, StateProviderFactory,
 };
 use reth_revm::{
+    access_list::AccessListInspector,
     database::State,
     env::tx_env_with_recovered,
     executor::{
@@ -29,6 +30,7 @@ use reth_revm::{
     into_reth_log,
     revm::{
         db::{CacheDB, DatabaseRef},
+        precompile::{Precompiles, SpecId as PrecompileSpecId},
         primitives::{result::InvalidTransaction, BlockEnv, CfgEnv, Env, ResultAndState},
         EVM,
     },
@@ -563,6 +565,8 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
 #[derive(Clone, Debug)]
 struct Execution {
     post_state: PostState,
+    #[allow(dead_code)]
+    access_list: AccessList,
     cumulative_gas_used: u64,
     total_fees: U256,
 }
@@ -583,6 +587,7 @@ where
     let block_num = block_env.number.to::<u64>();
 
     let mut total_fees = U256::ZERO;
+    let mut inspector = AccessListInspector::default();
     let mut post_state = PostState::default();
 
     for tx in txs {
@@ -607,7 +612,7 @@ where
         // TODO: add bound to DB error associated type so that we can use "?". for ease of testing
         // with `revm::db::EmptyDB`, we currently do not have the bound.
         let ResultAndState { result, state } = evm
-            .transact()
+            .inspect(&mut inspector)
             .map_err(|err| PayloadBuilderError::Internal(RethError::Custom(format!("{err:?}"))))?;
 
         // commit changes to DB and post state
@@ -632,8 +637,16 @@ where
         total_fees += U256::from(miner_fee) * U256::from(result.gas_used());
     }
 
+    // remove any precompiles from access list
+    let mut access_list = inspector.into_access_list();
+    let precompiles = precompiles(cfg_env);
+    access_list
+        .0
+        .retain(|item| !precompiles.contains(&item.address));
+
     Ok(Execution {
         post_state,
+        access_list,
         cumulative_gas_used,
         total_fees,
     })
@@ -688,13 +701,24 @@ fn package_block<S: StateProvider>(
     Ok(block.seal_slow())
 }
 
+fn precompiles(cfg_env: &CfgEnv) -> HashSet<Address> {
+    Precompiles::new(PrecompileSpecId::from_spec_id(cfg_env.spec_id))
+        .addresses()
+        .into_iter()
+        .map(Address::from)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use ethers::{
         signers::{LocalWallet, Signer},
-        types::{transaction::eip2718::TypedTransaction, Eip1559TransactionRequest},
+        types::{
+            transaction::{eip2718::TypedTransaction, eip2930::AccessList},
+            Bytes as EthersBytes, Eip1559TransactionRequest,
+        },
     };
     use reth_primitives::{Address, Bytes, TxType};
     use reth_revm::revm::{
@@ -753,8 +777,8 @@ mod tests {
             .max_fee_per_gas(max_fee)
             .max_priority_fee_per_gas(max_priority_fee)
             .value(transfer_amount)
-            .data(ethers::types::Bytes::default())
-            .access_list(ethers::types::transaction::eip2930::AccessList::default())
+            .data(EthersBytes::default())
+            .access_list(AccessList::default())
             .nonce(sender_nonce)
             .chain_id(cfg_env.chain_id.to::<u64>());
         let tx = TypedTransaction::Eip1559(tx);
@@ -769,6 +793,7 @@ mod tests {
             .expect("execution doesn't fail");
         let Execution {
             post_state,
+            access_list,
             cumulative_gas_used,
             total_fees,
         } = execution;
@@ -800,6 +825,12 @@ mod tests {
             .expect("receiver account touched")
             .expect("receiver account not destroyed");
         assert_eq!(receiver_account.balance, U256::from(transfer_amount));
+
+        // check access list
+        let access_list_addrs: HashSet<_> =
+            access_list.0.into_iter().map(|item| item.address).collect();
+        assert!(access_list_addrs.contains(&Address::from(sender_wallet.address())));
+        assert!(access_list_addrs.contains(&Address::from(receiver_wallet.address())));
 
         // check gas usage
         assert_eq!(cumulative_gas_used, expected_cumulative_gas_used);
