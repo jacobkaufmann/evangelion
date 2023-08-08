@@ -15,7 +15,7 @@ use reth_payload_builder::{
 use reth_primitives::{
     constants::{BEACON_NONCE, EMPTY_OMMER_ROOT},
     proofs, Block, BlockNumber, ChainSpec, Header, Receipt, SealedBlock, SealedHeader,
-    TransactionSigned, U256,
+    TransactionSigned, TransactionSignedEcRecovered, U256,
 };
 use reth_provider::{
     BlockReaderIdExt, CanonStateNotification, PostState, StateProvider, StateProviderFactory,
@@ -41,7 +41,7 @@ use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tokio_util::time::DelayQueue;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct BundleCompact(Vec<TransactionSigned>);
+pub struct BundleCompact(Vec<TransactionSignedEcRecovered>);
 
 impl BundleCompact {
     /// returns whether `self` conflicts with `other` in the sense that both cannot be executed
@@ -65,7 +65,7 @@ type BundleId = u64;
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Bundle {
     pub id: BundleId,
-    pub txs: Vec<TransactionSigned>,
+    pub txs: Vec<TransactionSignedEcRecovered>,
     pub block_num: BlockNumber,
     pub eligibility: RangeInclusive<u64>,
 }
@@ -546,7 +546,7 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
         &config.attributes,
         config.extra_data,
         &block_env,
-        txs,
+        txs.into_iter().map(|tx| tx.into_signed()).collect(),
         post_state,
         cumulative_gas_used,
     )?;
@@ -577,7 +577,7 @@ fn execute<DB, I>(
 where
     DB: DatabaseRef,
     <DB as DatabaseRef>::Error: std::fmt::Debug,
-    I: Iterator<Item = TransactionSigned>,
+    I: Iterator<Item = TransactionSignedEcRecovered>,
 {
     let base_fee = block_env.basefee.to::<u64>();
     let block_num = block_env.number.to::<u64>();
@@ -586,12 +586,6 @@ where
     let mut post_state = PostState::default();
 
     for tx in txs {
-        let tx = tx
-            .into_ecrecovered()
-            .ok_or(PayloadBuilderError::Internal(RethError::Custom(
-                "unable to recover tx signer".into(),
-            )))?;
-
         // construct EVM
         let tx_env = tx_env_with_recovered(&tx);
         let env = Env {
@@ -764,6 +758,7 @@ mod tests {
         let tx_encoded = tx.rlp_signed(&signature);
         let tx = TransactionSigned::decode_enveloped(Bytes::from(tx_encoded.as_ref()))
             .expect("can decode tx");
+        let tx = tx.into_ecrecovered().expect("can recover tx signer");
 
         let execution = execute(&mut db, &cfg_env, &block_env, 0, vec![tx].into_iter())
             .expect("execution doesn't fail");
