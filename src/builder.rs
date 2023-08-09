@@ -686,19 +686,19 @@ fn package_block<S: StateProvider>(
 
 /// Computes the payment to `coinbase` based on `initial_balance` and `post_state`.
 ///
-/// NOTE: If the account has been deleted, then we mark the payment zero. if the account was not
-/// modified, then the payment will also be computed as zero.
+/// NOTE: If the ending balance is less than `initial_balance`, then we define the payment as zero.
+/// If the account has been deleted, then we define the payment as zero. If the account was not
+/// modified, then the payment will be zero.
 fn compute_coinbase_payment(
     coinbase: &B160,
     initial_balance: U256,
     post_state: &PostState,
 ) -> U256 {
-    let end_balance = match post_state.account(coinbase) {
-        Some(Some(acct)) => acct.balance,
+    match post_state.account(coinbase) {
+        Some(Some(acct)) => acct.balance.saturating_sub(initial_balance),
         Some(None) => U256::ZERO,
-        None => initial_balance,
-    };
-    end_balance.saturating_sub(initial_balance)
+        None => U256::ZERO,
+    }
 }
 
 #[cfg(test)]
