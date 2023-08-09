@@ -29,7 +29,7 @@ use reth_revm::{
     into_reth_log,
     revm::{
         db::{CacheDB, DatabaseRef},
-        primitives::{result::InvalidTransaction, BlockEnv, CfgEnv, Env, ResultAndState},
+        primitives::{BlockEnv, CfgEnv, Env, ResultAndState},
         EVM,
     },
 };
@@ -486,7 +486,7 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
     let block_num = block_env.number.to::<u64>();
     let block_gas_limit: u64 = block_env.gas_limit.try_into().unwrap_or(u64::MAX);
 
-    let mut total_fees = U256::ZERO;
+    let mut coinbase_payment = U256::ZERO;
     let mut cumulative_gas_used = 0;
     let mut txs = Vec::new();
     let mut bundle_ids = HashSet::new();
@@ -516,7 +516,7 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
         );
 
         if let Ok(execution) = execution {
-            total_fees += execution.total_fees;
+            coinbase_payment += execution.coinbase_payment;
             cumulative_gas_used = execution.cumulative_gas_used;
 
             txs.append(&mut bundle);
@@ -551,7 +551,7 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
         cumulative_gas_used,
     )?;
 
-    let payload = BuiltPayload::new(config.attributes.id, block, total_fees);
+    let payload = BuiltPayload::new(config.attributes.id, block, coinbase_payment);
     let payload = Payload {
         inner: Arc::new(payload),
         bundles: bundle_ids,
@@ -564,7 +564,7 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
 struct Execution {
     post_state: PostState,
     cumulative_gas_used: u64,
-    total_fees: U256,
+    coinbase_payment: U256,
 }
 
 fn execute<DB, I>(
@@ -579,10 +579,14 @@ where
     <DB as DatabaseRef>::Error: std::fmt::Debug,
     I: Iterator<Item = TransactionSignedEcRecovered>,
 {
-    let base_fee = block_env.basefee.to::<u64>();
     let block_num = block_env.number.to::<u64>();
 
-    let mut total_fees = U256::ZERO;
+    // determine the initial balance of the account at the coinbase address
+    let coinbase_acct = db
+        .basic(block_env.coinbase)
+        .map_err(|err| PayloadBuilderError::Internal(RethError::Custom(format!("{err:?}"))))?;
+    let initial_coinbase_balance = coinbase_acct.map_or(U256::ZERO, |acct| acct.balance);
+
     let mut post_state = PostState::default();
 
     for tx in txs {
@@ -618,18 +622,27 @@ where
                 logs: result.logs().into_iter().map(into_reth_log).collect(),
             },
         );
-
-        let miner_fee = tx
-            .effective_tip_per_gas(base_fee)
-            .ok_or(InvalidTransaction::GasPriceLessThanBasefee)
-            .map_err(|err| PayloadBuilderError::EvmExecutionError(err.into()))?;
-        total_fees += U256::from(miner_fee) * U256::from(result.gas_used());
     }
+
+    // compute the payment based on the ending balance of the account at the coinbase address
+    //
+    // NOTE: if the account has been deleted, then we mark the payment zero. if the account was not
+    // modified, then the payment will also be computed as zero.
+    let end_coinbase_balance = match post_state.account(&block_env.coinbase) {
+        Some(Some(acct)) => acct.balance,
+        Some(None) => U256::ZERO,
+        None => initial_coinbase_balance,
+    };
+    let coinbase_payment = if end_coinbase_balance > initial_coinbase_balance {
+        end_coinbase_balance - initial_coinbase_balance
+    } else {
+        U256::ZERO
+    };
 
     Ok(Execution {
         post_state,
         cumulative_gas_used,
-        total_fees,
+        coinbase_payment,
     })
 }
 
@@ -688,13 +701,35 @@ mod tests {
 
     use ethers::{
         signers::{LocalWallet, Signer},
-        types::{transaction::eip2718::TypedTransaction, Eip1559TransactionRequest},
+        types::{transaction::eip2718::TypedTransaction, Eip1559TransactionRequest, NameOrAddress},
+        utils::keccak256,
     };
     use reth_primitives::{Address, Bytes, TxType};
     use reth_revm::revm::{
         db::EmptyDB,
-        primitives::{specification::SpecId, state::AccountInfo, B256},
+        primitives::{
+            specification::SpecId, state::AccountInfo, Bytecode, BytecodeState, B256, KECCAK_EMPTY,
+        },
     };
+
+    fn env(coinbase: Address, basefee: U256) -> (CfgEnv, BlockEnv) {
+        let cfg_env = CfgEnv {
+            chain_id: U256::from(1),
+            spec_id: SpecId::CANCUN,
+            ..Default::default()
+        };
+        let block_env = BlockEnv {
+            number: U256::ZERO,
+            coinbase,
+            timestamp: U256::ZERO,
+            difficulty: U256::ZERO,
+            prevrandao: Some(B256::random()),
+            basefee,
+            gas_limit: U256::from(15000000),
+        };
+
+        (cfg_env, block_env)
+    }
 
     #[test]
     fn execute_transfer() {
@@ -703,20 +738,7 @@ mod tests {
         // builder will be the coinbase (i.e. beneficiary)
         let builder_wallet = LocalWallet::new(&mut rand::thread_rng());
 
-        let cfg_env = CfgEnv {
-            chain_id: U256::from(1),
-            spec_id: SpecId::CANCUN,
-            ..Default::default()
-        };
-        let block_env = BlockEnv {
-            number: U256::ZERO,
-            coinbase: builder_wallet.address().into(),
-            timestamp: U256::ZERO,
-            difficulty: U256::ZERO,
-            prevrandao: Some(B256::random()),
-            basefee: U256::ZERO,
-            gas_limit: U256::from(15000000),
-        };
+        let (cfg_env, block_env) = env(builder_wallet.address().into(), U256::ZERO);
 
         let sender_wallet = LocalWallet::new(&mut rand::thread_rng());
         let initial_sender_balance = 10000000;
@@ -765,7 +787,7 @@ mod tests {
         let Execution {
             post_state,
             cumulative_gas_used,
-            total_fees,
+            coinbase_payment,
         } = execution;
 
         // expected gas usage is the transfer transaction's gas limit
@@ -799,8 +821,107 @@ mod tests {
         // check gas usage
         assert_eq!(cumulative_gas_used, expected_cumulative_gas_used);
 
-        // check fees
-        let expected_total_fees = tx_gas_limit * max_priority_fee;
-        assert_eq!(total_fees, U256::from(expected_total_fees));
+        // check coinbase payment
+        let expected_coinbase_payment = tx_gas_limit * max_priority_fee;
+        let builder_account = post_state
+            .account(&Address::from(builder_wallet.address()))
+            .expect("builder account touched")
+            .expect("builder account not destroyed");
+        assert_eq!(
+            builder_account.balance,
+            U256::from(expected_coinbase_payment)
+        );
+        assert_eq!(coinbase_payment, U256::from(expected_coinbase_payment));
+    }
+
+    #[test]
+    fn execute_coinbase_transfer() {
+        let mut db = CacheDB::new(EmptyDB());
+
+        // builder will be the coinbase (i.e. beneficiary)
+        let builder_wallet = LocalWallet::new(&mut rand::thread_rng());
+
+        let (cfg_env, block_env) = env(builder_wallet.address().into(), U256::ZERO);
+
+        // populate coinbase transfer smart contract in the DB
+        //
+        // h/t lightclient: https://github.com/lightclient/sendall
+        let bytecode = vec![0x5f, 0x5f, 0x5f, 0x5f, 0x47, 0x41, 0x5a, 0xf1, 0x00];
+        let code_hash = B256::from(keccak256(bytecode.clone()));
+        let bytecode = Bytecode {
+            bytecode: Bytes::from(bytecode).into(),
+            hash: code_hash,
+            state: BytecodeState::Raw,
+        };
+        let contract_acct = AccountInfo::new(U256::ZERO, 0, bytecode);
+        let contract_addr = Address::random();
+        db.insert_account_info(contract_addr, contract_acct);
+
+        // contract is the only account in the DB
+        let contract_addr = *db.accounts.keys().next().unwrap();
+
+        let sender_wallet = LocalWallet::new(&mut rand::thread_rng());
+        let initial_sender_balance = 10000000;
+        let sender_nonce = 0;
+
+        // populate sender account in the DB
+        db.insert_account_info(
+            sender_wallet.address().into(),
+            AccountInfo {
+                balance: U256::from(initial_sender_balance),
+                nonce: sender_nonce,
+                code_hash: KECCAK_EMPTY,
+                code: None,
+            },
+        );
+
+        let tx_value = 100;
+        let tx_gas_limit = 84000;
+        let max_priority_fee = 100;
+        let max_fee = block_env.basefee.to::<u64>() + max_priority_fee;
+
+        // construct the transfer transaction for execution
+        let tx = Eip1559TransactionRequest::new()
+            .from(sender_wallet.address())
+            .to(NameOrAddress::Address(ethers::types::H160::from(
+                contract_addr,
+            )))
+            .gas(tx_gas_limit)
+            .max_fee_per_gas(max_fee)
+            .max_priority_fee_per_gas(max_priority_fee)
+            .value(tx_value)
+            .data(ethers::types::Bytes::default())
+            .access_list(ethers::types::transaction::eip2930::AccessList::default())
+            .nonce(sender_nonce)
+            .chain_id(cfg_env.chain_id.to::<u64>());
+        let tx = TypedTransaction::Eip1559(tx);
+        let signature = sender_wallet
+            .sign_transaction_sync(&tx)
+            .expect("can sign tx");
+        let tx_encoded = tx.rlp_signed(&signature);
+        let tx = TransactionSigned::decode_enveloped(Bytes::from(tx_encoded.as_ref()))
+            .expect("can decode tx");
+        let tx = tx.into_ecrecovered().expect("can recover tx signer");
+
+        let execution = execute(&mut db, &cfg_env, &block_env, 0, vec![tx].into_iter())
+            .expect("execution doesn't fail");
+        let Execution {
+            post_state,
+            coinbase_payment,
+            cumulative_gas_used,
+            ..
+        } = execution;
+
+        // check coinbase payment
+        let expected_coinbase_payment = tx_value + (cumulative_gas_used * max_fee);
+        let builder_account = post_state
+            .account(&Address::from(builder_wallet.address()))
+            .expect("builder account touched")
+            .expect("builder account not destroyed");
+        assert_eq!(
+            builder_account.balance,
+            U256::from(expected_coinbase_payment)
+        );
+        assert_eq!(coinbase_payment, U256::from(expected_coinbase_payment));
     }
 }
