@@ -29,7 +29,7 @@ use reth_revm::{
     into_reth_log,
     revm::{
         db::{CacheDB, DatabaseRef},
-        primitives::{BlockEnv, CfgEnv, Env, ResultAndState},
+        primitives::{BlockEnv, CfgEnv, Env, ResultAndState, B160},
         EVM,
     },
 };
@@ -624,20 +624,9 @@ where
         );
     }
 
-    // compute the payment based on the ending balance of the account at the coinbase address
-    //
-    // NOTE: if the account has been deleted, then we mark the payment zero. if the account was not
-    // modified, then the payment will also be computed as zero.
-    let end_coinbase_balance = match post_state.account(&block_env.coinbase) {
-        Some(Some(acct)) => acct.balance,
-        Some(None) => U256::ZERO,
-        None => initial_coinbase_balance,
-    };
-    let coinbase_payment = if end_coinbase_balance > initial_coinbase_balance {
-        end_coinbase_balance - initial_coinbase_balance
-    } else {
-        U256::ZERO
-    };
+    // compute the coinbase payment
+    let coinbase_payment =
+        compute_coinbase_payment(&block_env.coinbase, initial_coinbase_balance, &post_state);
 
     Ok(Execution {
         post_state,
@@ -693,6 +682,23 @@ fn package_block<S: StateProvider>(
         withdrawals: Some(attributes.withdrawals.clone()),
     };
     Ok(block.seal_slow())
+}
+
+/// Computes the payment to `coinbase` based on `initial_balance` and `post_state`.
+///
+/// NOTE: If the account has been deleted, then we mark the payment zero. if the account was not
+/// modified, then the payment will also be computed as zero.
+fn compute_coinbase_payment(
+    coinbase: &B160,
+    initial_balance: U256,
+    post_state: &PostState,
+) -> U256 {
+    let end_balance = match post_state.account(coinbase) {
+        Some(Some(acct)) => acct.balance,
+        Some(None) => U256::ZERO,
+        None => initial_balance,
+    };
+    end_balance.saturating_sub(initial_balance)
 }
 
 #[cfg(test)]
