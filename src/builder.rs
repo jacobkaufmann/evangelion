@@ -822,7 +822,7 @@ mod tests {
         assert_eq!(cumulative_gas_used, expected_cumulative_gas_used);
 
         // check coinbase payment
-        let expected_coinbase_payment = tx_gas_limit * max_priority_fee;
+        let expected_coinbase_payment = cumulative_gas_used * max_priority_fee;
         let builder_account = post_state
             .account(&Address::from(builder_wallet.address()))
             .expect("builder account touched")
@@ -913,7 +913,7 @@ mod tests {
         } = execution;
 
         // check coinbase payment
-        let expected_coinbase_payment = tx_value + (cumulative_gas_used * max_fee);
+        let expected_coinbase_payment = tx_value + (cumulative_gas_used * max_priority_fee);
         let builder_account = post_state
             .account(&Address::from(builder_wallet.address()))
             .expect("builder account touched")
