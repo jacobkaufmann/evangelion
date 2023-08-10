@@ -6,6 +6,15 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ethers::{
+    signers::{LocalWallet, Signer},
+    types::{
+        transaction::{
+            eip1559::Eip1559TransactionRequest, eip2718::TypedTransaction, eip2930::AccessList,
+        },
+        Bytes as EthersBytes, NameOrAddress,
+    },
+};
 use futures_util::{stream::Fuse, FutureExt, Stream, StreamExt};
 use reth_interfaces::Error as RethError;
 use reth_payload_builder::{
@@ -14,7 +23,7 @@ use reth_payload_builder::{
 };
 use reth_primitives::{
     constants::{BEACON_NONCE, EMPTY_OMMER_ROOT},
-    proofs, Block, BlockNumber, ChainSpec, Header, Receipt, SealedBlock, SealedHeader,
+    proofs, Block, BlockNumber, Bytes, ChainSpec, Header, Receipt, SealedBlock, SealedHeader,
     TransactionSigned, TransactionSignedEcRecovered, U256,
 };
 use reth_provider::{
@@ -105,11 +114,17 @@ struct Payload {
 }
 
 #[derive(Clone, Debug)]
+struct PayloadAttributes {
+    inner: PayloadBuilderAttributes,
+    extra_data: u128,
+    wallet: LocalWallet,
+}
+
+#[derive(Clone, Debug)]
 struct JobConfig {
-    attributes: PayloadBuilderAttributes,
+    attributes: PayloadAttributes,
     parent: Arc<SealedHeader>,
     chain: Arc<ChainSpec>,
-    extra_data: u128,
 }
 
 /// a build job scoped to `config`
@@ -321,10 +336,16 @@ where
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct BuilderConfig {
+    pub extra_data: u128,
+    pub wallet: LocalWallet,
+}
+
 pub struct Builder<Client> {
+    config: BuilderConfig,
     chain: Arc<ChainSpec>,
     client: Arc<Client>,
-    extra_data: u128,
     bundle_pool: Arc<Mutex<BundlePool>>,
     incoming: broadcast::Sender<(BundleId, BlockNumber, BundleCompact)>,
     invalidated: broadcast::Sender<BundleId>,
@@ -334,7 +355,7 @@ impl<Client> Builder<Client>
 where
     Client: StateProviderFactory + Unpin,
 {
-    pub fn new(chain: ChainSpec, extra_data: u128, client: Client) -> Self {
+    pub fn new(config: BuilderConfig, chain: ChainSpec, client: Client) -> Self {
         let chain = Arc::new(chain);
         let client = Arc::new(client);
         let (incoming, _) = broadcast::channel(256);
@@ -344,9 +365,9 @@ where
         let bundle_pool = Arc::new(Mutex::new(bundle_pool));
 
         Self {
+            config,
             chain,
             client,
-            extra_data,
             bundle_pool,
             incoming,
             invalidated,
@@ -437,12 +458,17 @@ where
             )));
         }
 
+        let attributes = PayloadAttributes {
+            inner: attributes,
+            extra_data: self.config.extra_data,
+            wallet: self.config.wallet.clone(),
+        };
+
         let parent = Arc::new(latest.header.seal_slow());
         let config = JobConfig {
             chain: Arc::clone(&self.chain),
             parent,
             attributes,
-            extra_data: self.extra_data,
         };
 
         // collect eligible bundles from the pool
@@ -487,11 +513,20 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
 
     let mut post_state = PostState::default();
 
-    let (cfg_env, block_env) = config
+    let (cfg_env, mut block_env) = config
         .attributes
+        .inner
         .cfg_and_block_env(&config.chain, &config.parent);
-    let block_num = block_env.number.to::<u64>();
+
+    // mark the builder as the coinbase in the block env
+    block_env.coinbase = config.attributes.wallet.address().into();
+
     let block_gas_limit: u64 = block_env.gas_limit.try_into().unwrap_or(u64::MAX);
+    let block_num = block_env.number.to::<u64>();
+
+    // reserve gas for end-of-block proposer payment
+    const PROPOSER_PAYMENT_GAS_ALLOWANCE: u64 = 21000;
+    let execution_gas_limit = block_gas_limit - PROPOSER_PAYMENT_GAS_ALLOWANCE;
 
     let mut coinbase_payment = U256::ZERO;
     let mut cumulative_gas_used = 0;
@@ -501,7 +536,7 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
     for (id, bundle) in bundles {
         // check gas for entire bundle
         let bundle_gas_limit: u64 = bundle.0.iter().map(|tx| tx.gas_limit()).sum();
-        if cumulative_gas_used + bundle_gas_limit > block_gas_limit {
+        if cumulative_gas_used + bundle_gas_limit > execution_gas_limit {
             continue;
         }
 
@@ -538,11 +573,42 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
         bundle_ids.insert(id);
     }
 
+    // construct payment to proposer fee recipient.
+    //
+    // we give the entire coinbase payment to the proposer, except for the gas that we need to
+    // execute the transaction.
+    let builder_acct = db
+        .basic(block_env.coinbase)?
+        .expect("builder account exists");
+    let nonce = builder_acct.nonce;
+    let payment_amount =
+        coinbase_payment - (block_env.basefee * U256::from(PROPOSER_PAYMENT_GAS_ALLOWANCE));
+    let payment_tx = proposer_payment_tx(
+        &config.attributes.wallet,
+        nonce,
+        block_env.basefee.to::<u64>(),
+        cfg_env.chain_id.to::<u64>(),
+        &config.attributes.inner.suggested_fee_recipient,
+        payment_amount,
+    );
+
+    // execute payment to proposer fee recipient
+    let execution = execute(
+        &mut db,
+        &cfg_env,
+        &block_env,
+        cumulative_gas_used,
+        Some(payment_tx.clone()).into_iter(),
+    )?;
+    cumulative_gas_used = execution.cumulative_gas_used;
+    txs.push(payment_tx);
+    post_state.extend(execution.post_state);
+
     // NOTE: here we assume post-shanghai
     let balance_increments = post_block_withdrawals_balance_increments(
         &config.chain,
-        config.attributes.timestamp,
-        &config.attributes.withdrawals,
+        config.attributes.inner.timestamp,
+        &config.attributes.inner.withdrawals,
     );
     for (address, increment) in balance_increments {
         increment_account_balance(&mut db, &mut post_state, block_num, address, increment)?;
@@ -550,15 +616,15 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
 
     let block = package_block(
         state.state(),
-        &config.attributes,
-        config.extra_data,
+        &config.attributes.inner,
+        config.attributes.extra_data,
         &block_env,
         txs.into_iter().map(|tx| tx.into_signed()).collect(),
         post_state,
         cumulative_gas_used,
     )?;
 
-    let payload = BuiltPayload::new(config.attributes.id, block, coinbase_payment);
+    let payload = BuiltPayload::new(config.attributes.inner.id, block, coinbase_payment);
     let payload = Payload {
         inner: Arc::new(payload),
         bundles: bundle_ids,
@@ -708,6 +774,36 @@ fn compute_coinbase_payment(
     }
 }
 
+/// Constructs a transfer transaction to pay `amount` to `proposer`.
+fn proposer_payment_tx(
+    wallet: &LocalWallet,
+    nonce: u64,
+    base_fee: u64,
+    chain_id: u64,
+    proposer: &B160,
+    amount: U256,
+) -> TransactionSignedEcRecovered {
+    let tx = Eip1559TransactionRequest::new()
+        .from(wallet.address())
+        .to(NameOrAddress::Address(ethers::types::H160::from_slice(
+            proposer.as_bytes(),
+        )))
+        .gas(21000)
+        .max_fee_per_gas(base_fee)
+        .max_priority_fee_per_gas(0)
+        .value(amount)
+        .data(EthersBytes::default())
+        .access_list(AccessList::default())
+        .nonce(nonce)
+        .chain_id(chain_id);
+    let tx = TypedTransaction::Eip1559(tx);
+    let signature = wallet.sign_transaction_sync(&tx).expect("can sign tx");
+    let tx_encoded = tx.rlp_signed(&signature);
+    let tx = TransactionSigned::decode_enveloped(Bytes::from(tx_encoded.as_ref()))
+        .expect("can decode tx");
+    tx.into_ecrecovered().expect("can recover tx signer")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,8 +878,8 @@ mod tests {
             .max_fee_per_gas(max_fee)
             .max_priority_fee_per_gas(max_priority_fee)
             .value(transfer_amount)
-            .data(ethers::types::Bytes::default())
-            .access_list(ethers::types::transaction::eip2930::AccessList::default())
+            .data(EthersBytes::default())
+            .access_list(AccessList::default())
             .nonce(sender_nonce)
             .chain_id(cfg_env.chain_id.to::<u64>());
         let tx = TypedTransaction::Eip1559(tx);
@@ -903,8 +999,8 @@ mod tests {
             .max_fee_per_gas(max_fee)
             .max_priority_fee_per_gas(max_priority_fee)
             .value(tx_value)
-            .data(ethers::types::Bytes::default())
-            .access_list(ethers::types::transaction::eip2930::AccessList::default())
+            .data(EthersBytes::default())
+            .access_list(AccessList::default())
             .nonce(sender_nonce)
             .chain_id(cfg_env.chain_id.to::<u64>());
         let tx = TypedTransaction::Eip1559(tx);

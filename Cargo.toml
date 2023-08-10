@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ethers = "2.0.8"
 futures-util = "0.3.28"
 reth-interfaces = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-interfaces" }
 reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-payload-builder" }
@@ -20,5 +21,4 @@ revm = { git = "https://github.com/bluealloy/revm/", branch = "release/v25" }
 revm-primitives = { git = "https://github.com/bluealloy/revm/", branch = "release/v25" }
 
 [dev-dependencies]
-ethers = "2.0.8"
 rand = "0.8.5"
