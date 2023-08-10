@@ -92,7 +92,7 @@ impl BundlePool {
 
     /// maintains the pool based on updates to the canonical state.
     ///
-    /// returns the IDs of the bundles removed from the pool
+    /// returns the IDs of the bundles removed from the pool.
     pub fn maintain(&mut self, _event: CanonStateNotification) -> Vec<BundleId> {
         // remove all bundles
         self.0.drain().map(|bundle| bundle.id).collect()
