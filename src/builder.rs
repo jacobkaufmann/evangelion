@@ -90,10 +90,12 @@ impl BundlePool {
         self.0.retain(|bundle| *bundle.eligibility.end() >= now);
     }
 
-    /// maintains the pool based on updates to the canonical state
-    pub fn maintain(&mut self, _event: CanonStateNotification) {
+    /// maintains the pool based on updates to the canonical state.
+    ///
+    /// returns the IDs of the bundles removed from the pool
+    pub fn maintain(&mut self, _event: CanonStateNotification) -> Vec<BundleId> {
         // remove all bundles
-        self.0.clear();
+        self.0.drain().map(|bundle| bundle.id).collect()
     }
 }
 
@@ -399,7 +401,12 @@ where
                         let _ = invalidated.send(expired.into_inner());
                     }
                     Some(event) = state_events.recv() => {
-                        bundle_pool.lock().unwrap().maintain(event);
+                        // maintain the bundle pool based on state events. notify jobs about
+                        // invalidated bundles.
+                        let removed = bundle_pool.lock().unwrap().maintain(event);
+                        for bundle in removed {
+                            let _ = invalidated.send(bundle);
+                        }
                     }
                 }
             }
