@@ -287,7 +287,7 @@ where
         let empty = build(
             self.config.clone(),
             Arc::clone(&self.client),
-            self.bundles.clone().into_iter(),
+            None.into_iter(),
         )?;
         Ok(empty.inner)
     }
@@ -300,9 +300,8 @@ where
             let (tx, rx) = oneshot::channel();
             let config = self.config.clone();
             let client = Arc::clone(&self.client);
-            let bundles = self.bundles.clone().into_iter();
             task::spawn_blocking(move || {
-                let payload = build(config, client, bundles);
+                let payload = build(config, client, None.into_iter());
                 let _ = tx.send(payload);
             });
 
