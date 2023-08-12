@@ -593,17 +593,15 @@ where
                 txs.push(recovered_tx);
                 post_state.extend(execution.post_state);
             }
-            // if we have any error other than the nonce being too low, then we mark the
-            // transaction invalid
-            Err(PayloadBuilderError::EvmExecutionError(err)) => {
-                if !matches!(
-                    err,
-                    EVMError::Transaction(InvalidTransaction::NonceTooLow { .. })
-                ) {
+            // if we have any transaction error other than the nonce being too low, then we mark
+            // the transaction invalid
+            Err(PayloadBuilderError::EvmExecutionError(EVMError::Transaction(err))) => {
+                if !matches!(err, InvalidTransaction::NonceTooLow { .. }) {
                     mempool_txs.mark_invalid(&tx);
                 }
             }
-            Err(_other) => {}
+            // treat any other errors as fatal
+            Err(err) => return Err(err),
         }
     }
 
