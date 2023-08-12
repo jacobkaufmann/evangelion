@@ -3480,6 +3480,7 @@ dependencies = [
  "reth-interfaces",
  "reth-primitives",
  "reth-revm-primitives",
+ "reth-rlp",
  "reth-trie",
  "tokio",
  "tokio-stream",
