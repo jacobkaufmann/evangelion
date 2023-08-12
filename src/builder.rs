@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::matches;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -23,8 +24,8 @@ use reth_payload_builder::{
 };
 use reth_primitives::{
     constants::{BEACON_NONCE, EMPTY_OMMER_ROOT},
-    proofs, Block, BlockNumber, Bytes, ChainSpec, Header, Receipt, SealedBlock, SealedHeader,
-    TransactionSigned, TransactionSignedEcRecovered, U256,
+    proofs, Block, BlockNumber, Bytes, ChainSpec, Header, IntoRecoveredTransaction, Receipt,
+    SealedBlock, SealedHeader, TransactionSigned, TransactionSignedEcRecovered, U256,
 };
 use reth_provider::{
     BlockReaderIdExt, CanonStateNotification, PostState, StateProvider, StateProviderFactory,
@@ -38,10 +39,11 @@ use reth_revm::{
     into_reth_log,
     revm::{
         db::{CacheDB, DatabaseRef},
-        primitives::{BlockEnv, CfgEnv, Env, ResultAndState, B160},
+        primitives::{BlockEnv, CfgEnv, EVMError, Env, InvalidTransaction, ResultAndState, B160},
         EVM,
     },
 };
+use reth_transaction_pool::TransactionPool;
 use tokio::{
     sync::{broadcast, mpsc, oneshot},
     task,
@@ -128,9 +130,10 @@ struct JobConfig {
 }
 
 /// a build job scoped to `config`
-pub struct Job<Client> {
+pub struct Job<Client, Pool> {
     config: JobConfig,
     client: Arc<Client>,
+    pool: Arc<Pool>,
     bundles: HashMap<BundleId, BundleCompact>,
     incoming: Fuse<BroadcastStream<(BundleId, BlockNumber, BundleCompact)>>,
     invalidated: Fuse<BroadcastStream<BundleId>>,
@@ -138,10 +141,11 @@ pub struct Job<Client> {
     pending_payloads: VecDeque<task::JoinHandle<Result<Payload, PayloadBuilderError>>>,
 }
 
-impl<Client> Job<Client> {
+impl<Client, Pool> Job<Client, Pool> {
     fn new<I: Iterator<Item = Bundle>>(
         config: JobConfig,
         client: Arc<Client>,
+        pool: Arc<Pool>,
         bundles: I,
         incoming: Fuse<BroadcastStream<(BundleId, BlockNumber, BundleCompact)>>,
         invalidated: Fuse<BroadcastStream<BundleId>>,
@@ -155,6 +159,7 @@ impl<Client> Job<Client> {
         Self {
             config,
             client,
+            pool,
             bundles,
             invalidated,
             incoming,
@@ -164,9 +169,10 @@ impl<Client> Job<Client> {
     }
 }
 
-impl<Client> Future for Job<Client>
+impl<Client, Pool> Future for Job<Client, Pool>
 where
     Client: StateProviderFactory + 'static,
+    Pool: TransactionPool + 'static,
 {
     type Output = Result<(), PayloadBuilderError>;
 
@@ -224,9 +230,10 @@ where
             }
 
             let client = Arc::clone(&this.client);
+            let pool = Arc::clone(&this.pool);
             let pending = task::spawn_blocking(move || {
                 // TODO: come back to this
-                build(config, client, bundles.into_iter())
+                build(config, client, pool, bundles.into_iter())
             });
 
             this.pending_payloads.push_back(pending);
@@ -288,9 +295,10 @@ impl Future for PayloadTask {
     }
 }
 
-impl<Client> PayloadJob for Job<Client>
+impl<Client, Pool> PayloadJob for Job<Client, Pool>
 where
     Client: StateProviderFactory + Send + Sync + 'static,
+    Pool: TransactionPool + 'static,
 {
     type ResolvePayloadFuture = PayloadTask;
 
@@ -302,7 +310,8 @@ where
         let empty = build(
             self.config.clone(),
             Arc::clone(&self.client),
-            self.bundles.clone().into_iter(),
+            Arc::clone(&self.pool),
+            None.into_iter(),
         )?;
         Ok(empty.inner)
     }
@@ -315,9 +324,9 @@ where
             let (tx, rx) = oneshot::channel();
             let config = self.config.clone();
             let client = Arc::clone(&self.client);
-            let bundles = self.bundles.clone().into_iter();
+            let pool = Arc::clone(&self.pool);
             task::spawn_blocking(move || {
-                let payload = build(config, client, bundles);
+                let payload = build(config, client, pool, None.into_iter());
                 let _ = tx.send(payload);
             });
 
@@ -342,22 +351,25 @@ pub struct BuilderConfig {
     pub wallet: LocalWallet,
 }
 
-pub struct Builder<Client> {
+pub struct Builder<Client, Pool> {
     config: BuilderConfig,
     chain: Arc<ChainSpec>,
     client: Arc<Client>,
+    pool: Arc<Pool>,
     bundle_pool: Arc<Mutex<BundlePool>>,
     incoming: broadcast::Sender<(BundleId, BlockNumber, BundleCompact)>,
     invalidated: broadcast::Sender<BundleId>,
 }
 
-impl<Client> Builder<Client>
+impl<Client, Pool> Builder<Client, Pool>
 where
     Client: StateProviderFactory + Unpin,
+    Pool: TransactionPool + Unpin,
 {
-    pub fn new(config: BuilderConfig, chain: ChainSpec, client: Client) -> Self {
+    pub fn new(config: BuilderConfig, chain: ChainSpec, client: Client, pool: Pool) -> Self {
         let chain = Arc::new(chain);
         let client = Arc::new(client);
+        let pool = Arc::new(pool);
         let (incoming, _) = broadcast::channel(256);
         let (invalidated, _) = broadcast::channel(256);
 
@@ -368,6 +380,7 @@ where
             config,
             chain,
             client,
+            pool,
             bundle_pool,
             incoming,
             invalidated,
@@ -435,11 +448,12 @@ where
     }
 }
 
-impl<Client> PayloadJobGenerator for Builder<Client>
+impl<Client, Pool> PayloadJobGenerator for Builder<Client, Pool>
 where
     Client: StateProviderFactory + BlockReaderIdExt + 'static,
+    Pool: TransactionPool + 'static,
 {
-    type Job = Job<Client>;
+    type Job = Job<Client, Pool>;
 
     fn new_payload_job(
         &self,
@@ -486,6 +500,7 @@ where
         Ok(Job::new(
             config,
             Arc::clone(&self.client),
+            Arc::clone(&self.pool),
             bundles.into_iter(),
             incoming,
             invalidated,
@@ -493,21 +508,33 @@ where
     }
 }
 
-fn build<Client: StateProviderFactory, I: Iterator<Item = (BundleId, BundleCompact)>>(
+fn build<Client, P, I>(
     config: JobConfig,
     client: Arc<Client>,
+    pool: P,
     bundles: I,
-) -> Result<Payload, PayloadBuilderError> {
+) -> Result<Payload, PayloadBuilderError>
+where
+    Client: StateProviderFactory,
+    P: TransactionPool,
+    I: Iterator<Item = (BundleId, BundleCompact)>,
+{
     let state = client.state_by_block_hash(config.parent.hash)?;
     let state = State::new(state);
-    build_on_state(config, state, bundles)
+    build_on_state(config, state, pool, bundles)
 }
 
-fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)>>(
+fn build_on_state<S, P, I>(
     config: JobConfig,
     state: State<S>,
+    pool: P,
     bundles: I,
-) -> Result<Payload, PayloadBuilderError> {
+) -> Result<Payload, PayloadBuilderError>
+where
+    S: StateProvider,
+    P: TransactionPool,
+    I: Iterator<Item = (BundleId, BundleCompact)>,
+{
     let state = Arc::new(state);
     let mut db = CacheDB::new(Arc::clone(&state));
 
@@ -521,8 +548,9 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
     // mark the builder as the coinbase in the block env
     block_env.coinbase = config.attributes.wallet.address().into();
 
-    let block_gas_limit: u64 = block_env.gas_limit.try_into().unwrap_or(u64::MAX);
     let block_num = block_env.number.to::<u64>();
+    let base_fee = block_env.basefee.to::<u64>();
+    let block_gas_limit: u64 = block_env.gas_limit.try_into().unwrap_or(u64::MAX);
 
     // reserve gas for end-of-block proposer payment
     const PROPOSER_PAYMENT_GAS_ALLOWANCE: u64 = 21000;
@@ -533,6 +561,7 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
     let mut txs = Vec::new();
     let mut bundle_ids = HashSet::new();
 
+    // execute bundles
     for (id, bundle) in bundles {
         // check gas for entire bundle
         let bundle_gas_limit: u64 = bundle.0.iter().map(|tx| tx.gas_limit()).sum();
@@ -556,27 +585,65 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
             cumulative_gas_used,
             bundle.clone().into_iter(),
         );
+        match execution {
+            Ok(execution) => {
+                coinbase_payment += execution.coinbase_payment;
+                cumulative_gas_used = execution.cumulative_gas_used;
+                txs.append(&mut bundle);
+                post_state.extend(execution.post_state);
 
-        if let Ok(execution) = execution {
-            coinbase_payment += execution.coinbase_payment;
-            cumulative_gas_used = execution.cumulative_gas_used;
-
-            txs.append(&mut bundle);
-            post_state.extend(execution.post_state);
-
-            db = tmp_db;
-        } else {
-            continue;
+                db = tmp_db;
+            }
+            Err(_) => continue,
         }
 
         // add bundle to set of executed bundles
         bundle_ids.insert(id);
     }
 
+    // execute transactions from mempool
+    //
+    // TODO: support more sophisticated mixtures of bundles and transactions
+    let mut mempool_txs = pool.best_transactions_with_base_fee(base_fee);
+    while let Some(tx) = mempool_txs.next() {
+        // check gas
+        if cumulative_gas_used + tx.gas_limit() > execution_gas_limit {
+            continue;
+        }
+
+        let recovered_tx = tx.to_recovered_transaction();
+
+        // NOTE: we do not need to clone the DB here as we do for bundle execution
+        let execution = execute(
+            &mut db,
+            &cfg_env,
+            &block_env,
+            cumulative_gas_used,
+            Some(recovered_tx.clone()).into_iter(),
+        );
+        match execution {
+            Ok(execution) => {
+                coinbase_payment += execution.coinbase_payment;
+                cumulative_gas_used = execution.cumulative_gas_used;
+                txs.push(recovered_tx);
+                post_state.extend(execution.post_state);
+            }
+            // if we have any transaction error other than the nonce being too low, then we mark
+            // the transaction invalid
+            Err(EVMError::Transaction(err)) => {
+                if !matches!(err, InvalidTransaction::NonceTooLow { .. }) {
+                    mempool_txs.mark_invalid(&tx);
+                }
+            }
+            // treat any other errors as fatal
+            Err(err) => return Err(PayloadBuilderError::EvmExecutionError(err)),
+        }
+    }
+
     // construct payment to proposer fee recipient.
     //
-    // we give the entire coinbase payment to the proposer, except for the gas that we need to
-    // execute the transaction.
+    // NOTE: we give the entire coinbase payment to the proposer, except for the gas that we need
+    // to execute the transaction.
     let builder_acct = db
         .basic(block_env.coinbase)?
         .expect("builder account exists");
@@ -586,20 +653,23 @@ fn build_on_state<S: StateProvider, I: Iterator<Item = (BundleId, BundleCompact)
     let payment_tx = proposer_payment_tx(
         &config.attributes.wallet,
         nonce,
-        block_env.basefee.to::<u64>(),
+        base_fee,
         cfg_env.chain_id.to::<u64>(),
         &config.attributes.inner.suggested_fee_recipient,
         payment_amount,
     );
 
     // execute payment to proposer fee recipient
+    //
+    // if the payment transaction fails, then the entire payload build fails
     let execution = execute(
         &mut db,
         &cfg_env,
         &block_env,
         cumulative_gas_used,
         Some(payment_tx.clone()).into_iter(),
-    )?;
+    )
+    .map_err(PayloadBuilderError::EvmExecutionError)?;
     cumulative_gas_used = execution.cumulative_gas_used;
     txs.push(payment_tx);
     post_state.extend(execution.post_state);
@@ -640,24 +710,21 @@ struct Execution {
     coinbase_payment: U256,
 }
 
-fn execute<DB, I>(
-    db: &mut CacheDB<DB>,
+fn execute<S, I>(
+    db: &mut CacheDB<Arc<State<S>>>,
     cfg_env: &CfgEnv,
     block_env: &BlockEnv,
     mut cumulative_gas_used: u64,
     txs: I,
-) -> Result<Execution, PayloadBuilderError>
+) -> Result<Execution, EVMError<RethError>>
 where
-    DB: DatabaseRef,
-    <DB as DatabaseRef>::Error: std::fmt::Debug,
+    S: StateProvider,
     I: Iterator<Item = TransactionSignedEcRecovered>,
 {
     let block_num = block_env.number.to::<u64>();
 
     // determine the initial balance of the account at the coinbase address
-    let coinbase_acct = db
-        .basic(block_env.coinbase)
-        .map_err(|err| PayloadBuilderError::Internal(RethError::Custom(format!("{err:?}"))))?;
+    let coinbase_acct = db.basic(block_env.coinbase).map_err(EVMError::Database)?;
     let initial_coinbase_balance = coinbase_acct.map_or(U256::ZERO, |acct| acct.balance);
 
     let mut post_state = PostState::default();
@@ -674,12 +741,7 @@ where
         evm.database(&mut *db);
 
         // execute transaction
-        //
-        // TODO: add bound to DB error associated type so that we can use "?". for ease of testing
-        // with `revm::db::EmptyDB`, we currently do not have the bound.
-        let ResultAndState { result, state } = evm
-            .transact()
-            .map_err(|err| PayloadBuilderError::Internal(RethError::Custom(format!("{err:?}"))))?;
+        let ResultAndState { result, state } = evm.transact()?;
 
         // commit changes to DB and post state
         commit_state_changes(db, &mut post_state, block_num, state, true);
@@ -737,14 +799,16 @@ fn package_block<S: StateProvider>(
         receipts_root,
         withdrawals_root: Some(withdrawals_root),
         logs_bloom,
+        difficulty: U256::ZERO,
+        number: block_num,
+        gas_limit: block_gas_limit,
+        gas_used: cumulative_gas_used,
         timestamp: attributes.timestamp,
         mix_hash: attributes.prev_randao,
         nonce: BEACON_NONCE,
         base_fee_per_gas: Some(base_fee),
-        number: block_num,
-        gas_limit: block_gas_limit,
-        difficulty: U256::ZERO,
-        gas_used: cumulative_gas_used,
+        blob_gas_used: None,
+        excess_blob_gas: None,
         extra_data: extra_data.to_le_bytes().into(),
     };
 
@@ -814,11 +878,9 @@ mod tests {
         utils::keccak256,
     };
     use reth_primitives::{Address, Bytes, TxType};
-    use reth_revm::revm::{
-        db::EmptyDB,
-        primitives::{
-            specification::SpecId, state::AccountInfo, Bytecode, BytecodeState, B256, KECCAK_EMPTY,
-        },
+    use reth_provider::test_utils::MockEthProvider;
+    use reth_revm::revm::primitives::{
+        specification::SpecId, state::AccountInfo, Bytecode, BytecodeState, B256, KECCAK_EMPTY,
     };
 
     fn env(coinbase: Address, basefee: U256) -> (CfgEnv, BlockEnv) {
@@ -842,7 +904,9 @@ mod tests {
 
     #[test]
     fn execute_transfer() {
-        let mut db = CacheDB::new(EmptyDB());
+        let state = MockEthProvider::default();
+        let state = State::new(state);
+        let mut db = CacheDB::new(Arc::new(state));
 
         // builder will be the coinbase (i.e. beneficiary)
         let builder_wallet = LocalWallet::new(&mut rand::thread_rng());
@@ -945,7 +1009,9 @@ mod tests {
 
     #[test]
     fn execute_coinbase_transfer() {
-        let mut db = CacheDB::new(EmptyDB());
+        let state = MockEthProvider::default();
+        let state = State::new(state);
+        let mut db = CacheDB::new(Arc::new(state));
 
         // builder will be the coinbase (i.e. beneficiary)
         let builder_wallet = LocalWallet::new(&mut rand::thread_rng());

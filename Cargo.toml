@@ -6,12 +6,13 @@ edition = "2021"
 [dependencies]
 ethers = "2.0.8"
 futures-util = "0.3.28"
-reth-interfaces = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-interfaces" }
-reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-payload-builder" }
-reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-primitives" }
-reth-provider = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-provider" }
-reth-revm = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm" }
-reth-revm-primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm-primitives" }
+reth-interfaces = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-interfaces", version = "0.1.0-alpha.6" }
+reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-payload-builder", version = "0.1.0-alpha.6" }
+reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-primitives", version = "0.1.0-alpha.6" }
+reth-provider = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-provider", version = "0.1.0-alpha.6" }
+reth-revm = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm", version = "0.1.0-alpha.6" }
+reth-revm-primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm-primitives", version = "0.1.0-alpha.6" }
+reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-transaction-pool", version = "0.1.0-alpha.6" }
 tokio = "1.29.1"
 tokio-stream = { version = "0.1.14", features = ["sync"] }
 tokio-util = { version = "0.7.8", features = ["time"] }
@@ -22,3 +23,4 @@ revm-primitives = { git = "https://github.com/bluealloy/revm/", branch = "releas
 
 [dev-dependencies]
 rand = "0.8.5"
+reth-provider = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-provider", version = "0.1.0-alpha.6", features = ["test-utils"] }
