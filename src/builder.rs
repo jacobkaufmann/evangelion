@@ -550,16 +550,16 @@ where
             cumulative_gas_used,
             bundle.clone().into_iter(),
         );
+        match execution {
+            Ok(execution) => {
+                coinbase_payment += execution.coinbase_payment;
+                cumulative_gas_used = execution.cumulative_gas_used;
+                txs.append(&mut bundle);
+                post_state.extend(execution.post_state);
 
-        if let Ok(execution) = execution {
-            coinbase_payment += execution.coinbase_payment;
-            cumulative_gas_used = execution.cumulative_gas_used;
-            txs.append(&mut bundle);
-            post_state.extend(execution.post_state);
-
-            db = tmp_db;
-        } else {
-            continue;
+                db = tmp_db;
+            }
+            Err(_) => continue,
         }
 
         // add bundle to set of executed bundles
@@ -579,13 +579,14 @@ where
         let recovered_tx = tx.to_recovered_transaction();
 
         // NOTE: we do not need to clone the DB here as we do for bundle execution
-        match execute(
+        let execution = execute(
             &mut db,
             &cfg_env,
             &block_env,
             cumulative_gas_used,
             Some(recovered_tx.clone()).into_iter(),
-        ) {
+        );
+        match execution {
             Ok(execution) => {
                 coinbase_payment += execution.coinbase_payment;
                 cumulative_gas_used = execution.cumulative_gas_used;
@@ -594,13 +595,13 @@ where
             }
             // if we have any transaction error other than the nonce being too low, then we mark
             // the transaction invalid
-            Err(PayloadBuilderError::EvmExecutionError(EVMError::Transaction(err))) => {
+            Err(EVMError::Transaction(err)) => {
                 if !matches!(err, InvalidTransaction::NonceTooLow { .. }) {
                     mempool_txs.mark_invalid(&tx);
                 }
             }
             // treat any other errors as fatal
-            Err(err) => return Err(err),
+            Err(err) => return Err(PayloadBuilderError::EvmExecutionError(err)),
         }
     }
 
@@ -640,24 +641,21 @@ struct Execution {
     coinbase_payment: U256,
 }
 
-fn execute<DB, I>(
-    db: &mut CacheDB<DB>,
+fn execute<S, I>(
+    db: &mut CacheDB<Arc<State<S>>>,
     cfg_env: &CfgEnv,
     block_env: &BlockEnv,
     mut cumulative_gas_used: u64,
     txs: I,
-) -> Result<Execution, PayloadBuilderError>
+) -> Result<Execution, EVMError<RethError>>
 where
-    DB: DatabaseRef,
-    <DB as DatabaseRef>::Error: std::fmt::Debug,
+    S: StateProvider,
     I: Iterator<Item = TransactionSignedEcRecovered>,
 {
     let block_num = block_env.number.to::<u64>();
 
     // determine the initial balance of the account at the coinbase address
-    let coinbase_acct = db
-        .basic(block_env.coinbase)
-        .map_err(|err| PayloadBuilderError::Internal(RethError::Custom(format!("{err:?}"))))?;
+    let coinbase_acct = db.basic(block_env.coinbase).map_err(EVMError::Database)?;
     let initial_coinbase_balance = coinbase_acct.map_or(U256::ZERO, |acct| acct.balance);
 
     let mut post_state = PostState::default();
@@ -674,12 +672,7 @@ where
         evm.database(&mut *db);
 
         // execute transaction
-        //
-        // TODO: add bound to DB error associated type so that we can use "?". for ease of testing
-        // with `revm::db::EmptyDB`, we currently do not have the bound.
-        let ResultAndState { result, state } = evm
-            .transact()
-            .map_err(|err| PayloadBuilderError::Internal(RethError::Custom(format!("{err:?}"))))?;
+        let ResultAndState { result, state } = evm.transact()?;
 
         // commit changes to DB and post state
         commit_state_changes(db, &mut post_state, block_num, state, true);
@@ -786,11 +779,9 @@ mod tests {
         utils::keccak256,
     };
     use reth_primitives::{Address, Bytes, TxType};
-    use reth_revm::revm::{
-        db::EmptyDB,
-        primitives::{
-            specification::SpecId, state::AccountInfo, Bytecode, BytecodeState, B256, KECCAK_EMPTY,
-        },
+    use reth_provider::test_utils::MockEthProvider;
+    use reth_revm::revm::primitives::{
+        specification::SpecId, state::AccountInfo, Bytecode, BytecodeState, B256, KECCAK_EMPTY,
     };
 
     fn env(coinbase: Address, basefee: U256) -> (CfgEnv, BlockEnv) {
@@ -814,7 +805,9 @@ mod tests {
 
     #[test]
     fn execute_transfer() {
-        let mut db = CacheDB::new(EmptyDB());
+        let state = MockEthProvider::default();
+        let state = State::new(state);
+        let mut db = CacheDB::new(Arc::new(state));
 
         // builder will be the coinbase (i.e. beneficiary)
         let builder_wallet = LocalWallet::new(&mut rand::thread_rng());
@@ -917,7 +910,9 @@ mod tests {
 
     #[test]
     fn execute_coinbase_transfer() {
-        let mut db = CacheDB::new(EmptyDB());
+        let state = MockEthProvider::default();
+        let state = State::new(state);
+        let mut db = CacheDB::new(Arc::new(state));
 
         // builder will be the coinbase (i.e. beneficiary)
         let builder_wallet = LocalWallet::new(&mut rand::thread_rng());
