@@ -643,36 +643,39 @@ where
     // construct payment to proposer fee recipient.
     //
     // NOTE: we give the entire coinbase payment to the proposer, except for the gas that we need
-    // to execute the transaction.
+    // to execute the transaction. if the coinbase payment cannot cover the gas cost to pay the
+    // proposer, then we do not do any payment.
     let builder_acct = db
         .basic(block_env.coinbase)?
         .expect("builder account exists");
     let nonce = builder_acct.nonce;
-    let payment_amount =
-        coinbase_payment - (block_env.basefee * U256::from(PROPOSER_PAYMENT_GAS_ALLOWANCE));
-    let payment_tx = proposer_payment_tx(
-        &config.attributes.wallet,
-        nonce,
-        base_fee,
-        cfg_env.chain_id.to::<u64>(),
-        &config.attributes.inner.suggested_fee_recipient,
-        payment_amount,
-    );
+    let payment_tx_gas_cost = block_env.basefee * U256::from(PROPOSER_PAYMENT_GAS_ALLOWANCE);
+    let proposer_payment = coinbase_payment.saturating_sub(payment_tx_gas_cost);
+    if proposer_payment > U256::ZERO {
+        let payment_tx = proposer_payment_tx(
+            &config.attributes.wallet,
+            nonce,
+            base_fee,
+            cfg_env.chain_id.to::<u64>(),
+            &config.attributes.inner.suggested_fee_recipient,
+            proposer_payment,
+        );
 
-    // execute payment to proposer fee recipient
-    //
-    // if the payment transaction fails, then the entire payload build fails
-    let execution = execute(
-        &mut db,
-        &cfg_env,
-        &block_env,
-        cumulative_gas_used,
-        Some(payment_tx.clone()).into_iter(),
-    )
-    .map_err(PayloadBuilderError::EvmExecutionError)?;
-    cumulative_gas_used = execution.cumulative_gas_used;
-    txs.push(payment_tx);
-    post_state.extend(execution.post_state);
+        // execute payment to proposer fee recipient
+        //
+        // if the payment transaction fails, then the entire payload build fails
+        let execution = execute(
+            &mut db,
+            &cfg_env,
+            &block_env,
+            cumulative_gas_used,
+            Some(payment_tx.clone()).into_iter(),
+        )
+        .map_err(PayloadBuilderError::EvmExecutionError)?;
+        cumulative_gas_used = execution.cumulative_gas_used;
+        txs.push(payment_tx);
+        post_state.extend(execution.post_state);
+    }
 
     // NOTE: here we assume post-shanghai
     let balance_increments = post_block_withdrawals_balance_increments(
@@ -694,7 +697,7 @@ where
         cumulative_gas_used,
     )?;
 
-    let payload = BuiltPayload::new(config.attributes.inner.id, block, coinbase_payment);
+    let payload = BuiltPayload::new(config.attributes.inner.id, block, proposer_payment);
     let payload = Payload {
         inner: Arc::new(payload),
         bundles: bundle_ids,
