@@ -296,7 +296,7 @@ where
             self.config.clone(),
             Arc::clone(&self.client),
             Arc::clone(&self.pool),
-            self.bundles.clone().into_iter(),
+            None.into_iter(),
         )?;
         Ok(empty.inner)
     }
@@ -310,9 +310,8 @@ where
             let config = self.config.clone();
             let client = Arc::clone(&self.client);
             let pool = Arc::clone(&self.pool);
-            let bundles = self.bundles.clone().into_iter();
             task::spawn_blocking(move || {
-                let payload = build(config, client, pool, bundles);
+                let payload = build(config, client, pool, None.into_iter());
                 let _ = tx.send(payload);
             });
 
