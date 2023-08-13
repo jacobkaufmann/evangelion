@@ -43,7 +43,7 @@ use reth_revm::{
         EVM,
     },
 };
-use reth_transaction_pool::TransactionPool;
+use reth_transaction_pool::{noop::NoopTransactionPool, TransactionPool};
 use tokio::{
     sync::{broadcast, mpsc, oneshot},
     task,
@@ -310,7 +310,7 @@ where
         let empty = build(
             self.config.clone(),
             Arc::clone(&self.client),
-            Arc::clone(&self.pool),
+            Arc::new(NoopTransactionPool::default()),
             None.into_iter(),
         )?;
         Ok(empty.inner)
@@ -324,7 +324,7 @@ where
             let (tx, rx) = oneshot::channel();
             let config = self.config.clone();
             let client = Arc::clone(&self.client);
-            let pool = Arc::clone(&self.pool);
+            let pool = Arc::new(NoopTransactionPool::default());
             task::spawn_blocking(move || {
                 let payload = build(config, client, pool, None.into_iter());
                 let _ = tx.send(payload);
@@ -877,14 +877,16 @@ mod tests {
 
     use ethers::{
         signers::{LocalWallet, Signer},
-        types::{transaction::eip2718::TypedTransaction, Eip1559TransactionRequest, NameOrAddress},
-        utils::keccak256,
+        types::{
+            transaction::eip2718::TypedTransaction, Eip1559TransactionRequest, NameOrAddress,
+            H160 as EthersAddress,
+        },
     };
     use reth_primitives::{Address, Bytes, TxType};
-    use reth_provider::test_utils::MockEthProvider;
-    use reth_revm::revm::primitives::{
-        specification::SpecId, state::AccountInfo, Bytecode, BytecodeState, B256, KECCAK_EMPTY,
-    };
+    use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+    use reth_revm::revm::primitives::{specification::SpecId, B256};
+
+    const TRANSFER_GAS_LIMIT: u64 = 21000;
 
     fn env(coinbase: Address, basefee: U256) -> (CfgEnv, BlockEnv) {
         let cfg_env = CfgEnv {
@@ -905,9 +907,45 @@ mod tests {
         (cfg_env, block_env)
     }
 
+    fn tx(
+        from: &LocalWallet,
+        to: EthersAddress,
+        gas_limit: u64,
+        max_fee_per_gas: u64,
+        max_priority_fee_per_gas: u64,
+        value: u64,
+        nonce: u64,
+    ) -> TransactionSignedEcRecovered {
+        let tx = Eip1559TransactionRequest::new()
+            .from(from.address())
+            .to(NameOrAddress::Address(to))
+            .gas(gas_limit)
+            .max_fee_per_gas(max_fee_per_gas)
+            .max_priority_fee_per_gas(max_priority_fee_per_gas)
+            .value(value)
+            .data(ethers::types::Bytes::default())
+            .access_list(ethers::types::transaction::eip2930::AccessList::default())
+            .nonce(nonce)
+            .chain_id(from.chain_id());
+        let tx = TypedTransaction::Eip1559(tx);
+        let signature = from.sign_transaction_sync(&tx).expect("can sign tx");
+        let tx_encoded = tx.rlp_signed(&signature);
+        let tx = TransactionSigned::decode_enveloped(Bytes::from(tx_encoded.as_ref()))
+            .expect("can decode tx");
+        tx.into_ecrecovered().expect("can recover tx signer")
+    }
+
     #[test]
     fn execute_transfer() {
         let state = MockEthProvider::default();
+
+        // add sender account to state
+        let sender_wallet = LocalWallet::new(&mut rand::thread_rng());
+        let initial_sender_balance = 10000000;
+        let sender_nonce = 0;
+        let sender_account = ExtendedAccount::new(sender_nonce, U256::from(initial_sender_balance));
+        state.add_account(sender_wallet.address().into(), sender_account);
+
         let state = State::new(state);
         let mut db = CacheDB::new(Arc::new(state));
 
@@ -916,50 +954,31 @@ mod tests {
 
         let (cfg_env, block_env) = env(builder_wallet.address().into(), U256::ZERO);
 
-        let sender_wallet = LocalWallet::new(&mut rand::thread_rng());
-        let initial_sender_balance = 10000000;
-        let sender_nonce = 0;
-
-        // populate sender account in the DB
-        db.insert_account_info(
-            sender_wallet.address().into(),
-            AccountInfo {
-                balance: U256::from(initial_sender_balance),
-                nonce: sender_nonce,
-                code_hash: B256::zero(),
-                code: None,
-            },
-        );
-
         let receiver_wallet = LocalWallet::new(&mut rand::thread_rng());
         let transfer_amount = 100;
-        let tx_gas_limit = 21000;
         let max_priority_fee = 100;
         let max_fee = block_env.basefee.to::<u64>() + max_priority_fee;
 
         // construct the transfer transaction for execution
-        let tx = Eip1559TransactionRequest::new()
-            .from(sender_wallet.address())
-            .to(receiver_wallet.address())
-            .gas(tx_gas_limit)
-            .max_fee_per_gas(max_fee)
-            .max_priority_fee_per_gas(max_priority_fee)
-            .value(transfer_amount)
-            .data(EthersBytes::default())
-            .access_list(AccessList::default())
-            .nonce(sender_nonce)
-            .chain_id(cfg_env.chain_id.to::<u64>());
-        let tx = TypedTransaction::Eip1559(tx);
-        let signature = sender_wallet
-            .sign_transaction_sync(&tx)
-            .expect("can sign tx");
-        let tx_encoded = tx.rlp_signed(&signature);
-        let tx = TransactionSigned::decode_enveloped(Bytes::from(tx_encoded.as_ref()))
-            .expect("can decode tx");
-        let tx = tx.into_ecrecovered().expect("can recover tx signer");
+        let transfer_tx = tx(
+            &sender_wallet,
+            receiver_wallet.address(),
+            TRANSFER_GAS_LIMIT,
+            max_fee,
+            max_priority_fee,
+            transfer_amount,
+            sender_nonce,
+        );
 
-        let execution = execute(&mut db, &cfg_env, &block_env, 0, vec![tx].into_iter())
-            .expect("execution doesn't fail");
+        // execute the transfer transaction
+        let execution = execute(
+            &mut db,
+            &cfg_env,
+            &block_env,
+            0,
+            Some(transfer_tx).into_iter(),
+        )
+        .expect("execution doesn't fail");
         let Execution {
             post_state,
             cumulative_gas_used,
@@ -967,7 +986,7 @@ mod tests {
         } = execution;
 
         // expected gas usage is the transfer transaction's gas limit
-        let expected_cumulative_gas_used = tx_gas_limit;
+        let expected_cumulative_gas_used = TRANSFER_GAS_LIMIT;
 
         // check post state contains transaction receipt
         let receipt = post_state
@@ -984,7 +1003,7 @@ mod tests {
             .expect("sender account touched")
             .expect("sender account not destroyed");
         let expected_sender_balance =
-            initial_sender_balance - transfer_amount - (max_fee * tx_gas_limit);
+            initial_sender_balance - transfer_amount - (max_fee * receipt.cumulative_gas_used);
         assert_eq!(sender_account.balance, U256::from(expected_sender_balance));
 
         // check post-execution receiver balance
@@ -1013,6 +1032,22 @@ mod tests {
     #[test]
     fn execute_coinbase_transfer() {
         let state = MockEthProvider::default();
+
+        // populate coinbase transfer smart contract in the DB
+        //
+        // h/t lightclient: https://github.com/lightclient/sendall
+        let contract_addr = Address::random();
+        let bytecode = vec![0x5f, 0x5f, 0x5f, 0x5f, 0x47, 0x41, 0x5a, 0xf1, 0x00];
+        let contract_acct = ExtendedAccount::new(0, U256::ZERO).with_bytecode(bytecode.into());
+        state.add_account(contract_addr, contract_acct);
+
+        // add caller account to state
+        let sender_wallet = LocalWallet::new(&mut rand::thread_rng());
+        let initial_sender_balance = 10000000;
+        let sender_nonce = 0;
+        let sender_account = ExtendedAccount::new(sender_nonce, U256::from(initial_sender_balance));
+        state.add_account(sender_wallet.address().into(), sender_account);
+
         let state = State::new(state);
         let mut db = CacheDB::new(Arc::new(state));
 
@@ -1021,67 +1056,23 @@ mod tests {
 
         let (cfg_env, block_env) = env(builder_wallet.address().into(), U256::ZERO);
 
-        // populate coinbase transfer smart contract in the DB
-        //
-        // h/t lightclient: https://github.com/lightclient/sendall
-        let bytecode = vec![0x5f, 0x5f, 0x5f, 0x5f, 0x47, 0x41, 0x5a, 0xf1, 0x00];
-        let code_hash = B256::from(keccak256(bytecode.clone()));
-        let bytecode = Bytecode {
-            bytecode: Bytes::from(bytecode).into(),
-            hash: code_hash,
-            state: BytecodeState::Raw,
-        };
-        let contract_acct = AccountInfo::new(U256::ZERO, 0, bytecode);
-        let contract_addr = Address::random();
-        db.insert_account_info(contract_addr, contract_acct);
-
-        // contract is the only account in the DB
-        let contract_addr = *db.accounts.keys().next().unwrap();
-
-        let sender_wallet = LocalWallet::new(&mut rand::thread_rng());
-        let initial_sender_balance = 10000000;
-        let sender_nonce = 0;
-
-        // populate sender account in the DB
-        db.insert_account_info(
-            sender_wallet.address().into(),
-            AccountInfo {
-                balance: U256::from(initial_sender_balance),
-                nonce: sender_nonce,
-                code_hash: KECCAK_EMPTY,
-                code: None,
-            },
-        );
-
         let tx_value = 100;
         let tx_gas_limit = 84000;
         let max_priority_fee = 100;
         let max_fee = block_env.basefee.to::<u64>() + max_priority_fee;
 
-        // construct the transfer transaction for execution
-        let tx = Eip1559TransactionRequest::new()
-            .from(sender_wallet.address())
-            .to(NameOrAddress::Address(ethers::types::H160::from(
-                contract_addr,
-            )))
-            .gas(tx_gas_limit)
-            .max_fee_per_gas(max_fee)
-            .max_priority_fee_per_gas(max_priority_fee)
-            .value(tx_value)
-            .data(EthersBytes::default())
-            .access_list(AccessList::default())
-            .nonce(sender_nonce)
-            .chain_id(cfg_env.chain_id.to::<u64>());
-        let tx = TypedTransaction::Eip1559(tx);
-        let signature = sender_wallet
-            .sign_transaction_sync(&tx)
-            .expect("can sign tx");
-        let tx_encoded = tx.rlp_signed(&signature);
-        let tx = TransactionSigned::decode_enveloped(Bytes::from(tx_encoded.as_ref()))
-            .expect("can decode tx");
-        let tx = tx.into_ecrecovered().expect("can recover tx signer");
+        // construct the contract call transaction for execution
+        let call_tx = tx(
+            &sender_wallet,
+            EthersAddress(*contract_addr),
+            tx_gas_limit,
+            max_fee,
+            max_priority_fee,
+            tx_value,
+            sender_nonce,
+        );
 
-        let execution = execute(&mut db, &cfg_env, &block_env, 0, vec![tx].into_iter())
+        let execution = execute(&mut db, &cfg_env, &block_env, 0, Some(call_tx).into_iter())
             .expect("execution doesn't fail");
         let Execution {
             post_state,
