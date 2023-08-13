@@ -34,7 +34,7 @@ use reth_revm::{
         EVM,
     },
 };
-use reth_transaction_pool::TransactionPool;
+use reth_transaction_pool::{noop::NoopTransactionPool, TransactionPool};
 use tokio::{
     sync::{broadcast, mpsc, oneshot},
     task,
@@ -295,7 +295,7 @@ where
         let empty = build(
             self.config.clone(),
             Arc::clone(&self.client),
-            Arc::clone(&self.pool),
+            Arc::new(NoopTransactionPool::default()),
             None.into_iter(),
         )?;
         Ok(empty.inner)
@@ -309,7 +309,7 @@ where
             let (tx, rx) = oneshot::channel();
             let config = self.config.clone();
             let client = Arc::clone(&self.client);
-            let pool = Arc::clone(&self.pool);
+            let pool = Arc::new(NoopTransactionPool::default());
             task::spawn_blocking(move || {
                 let payload = build(config, client, pool, None.into_iter());
                 let _ = tx.send(payload);
