@@ -352,8 +352,9 @@ pub struct BuilderConfig {
 }
 
 pub struct Builder<Client, Pool> {
-    config: BuilderConfig,
     chain: Arc<ChainSpec>,
+    wallet: LocalWallet,
+    extra_data: u128,
     client: Arc<Client>,
     pool: Arc<Pool>,
     bundle_pool: Arc<Mutex<BundlePool>>,
@@ -377,8 +378,9 @@ where
         let bundle_pool = Arc::new(Mutex::new(bundle_pool));
 
         Self {
-            config,
             chain,
+            wallet: config.wallet,
+            extra_data: config.extra_data,
             client,
             pool,
             bundle_pool,
@@ -474,8 +476,8 @@ where
 
         let attributes = PayloadAttributes {
             inner: attributes,
-            extra_data: self.config.extra_data,
-            wallet: self.config.wallet.clone(),
+            extra_data: self.extra_data,
+            wallet: self.wallet.clone(),
         };
 
         let parent = Arc::new(latest.header.seal_slow());
@@ -647,10 +649,10 @@ where
     // proposer, then we do not make any payment.
     let payment_tx_gas_cost = block_env.basefee * U256::from(PROPOSER_PAYMENT_GAS_ALLOWANCE);
     let proposer_payment = coinbase_payment.saturating_sub(payment_tx_gas_cost);
-    if proposer_payment > payment_tx_gas_cost {
+    if proposer_payment > U256::ZERO {
         let builder_acct = db
             .basic(block_env.coinbase)?
-            .expect("builder account exists if payment non-zero");
+            .expect("builder account exists if coinbase payment non-zero");
         let payment_tx = proposer_payment_tx(
             &config.attributes.wallet,
             builder_acct.nonce,
