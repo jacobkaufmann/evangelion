@@ -644,17 +644,16 @@ where
     //
     // NOTE: we give the entire coinbase payment to the proposer, except for the gas that we need
     // to execute the transaction. if the coinbase payment cannot cover the gas cost to pay the
-    // proposer, then we do not do any payment.
-    let builder_acct = db
-        .basic(block_env.coinbase)?
-        .expect("builder account exists");
-    let nonce = builder_acct.nonce;
+    // proposer, then we do not make any payment.
     let payment_tx_gas_cost = block_env.basefee * U256::from(PROPOSER_PAYMENT_GAS_ALLOWANCE);
     let proposer_payment = coinbase_payment.saturating_sub(payment_tx_gas_cost);
-    if proposer_payment > U256::ZERO {
+    if proposer_payment > payment_tx_gas_cost {
+        let builder_acct = db
+            .basic(block_env.coinbase)?
+            .expect("builder account exists if payment non-zero");
         let payment_tx = proposer_payment_tx(
             &config.attributes.wallet,
-            nonce,
+            builder_acct.nonce,
             base_fee,
             cfg_env.chain_id.to::<u64>(),
             &config.attributes.inner.suggested_fee_recipient,
