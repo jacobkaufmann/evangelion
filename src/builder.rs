@@ -142,7 +142,7 @@ pub struct Job<Client, Pool> {
 }
 
 impl<Client, Pool> Job<Client, Pool> {
-    fn new<I: Iterator<Item = Bundle>>(
+    fn new<I: IntoIterator<Item = Bundle>>(
         config: JobConfig,
         client: Arc<Client>,
         pool: Arc<Pool>,
@@ -151,6 +151,7 @@ impl<Client, Pool> Job<Client, Pool> {
         invalidated: Fuse<BroadcastStream<BundleId>>,
     ) -> Self {
         let bundles = bundles
+            .into_iter()
             .map(|bundle| (bundle.id, BundleCompact(bundle.txs)))
             .collect();
         let built_payloads = Vec::new();
@@ -233,7 +234,7 @@ where
             let pool = Arc::clone(&this.pool);
             let pending = task::spawn_blocking(move || {
                 // TODO: come back to this
-                build(config, client, pool, bundles.into_iter())
+                build(config, client, pool, bundles)
             });
 
             this.pending_payloads.push_back(pending);
@@ -311,7 +312,7 @@ where
             self.config.clone(),
             Arc::clone(&self.client),
             Arc::new(NoopTransactionPool::default()),
-            None.into_iter(),
+            None,
         )?;
         Ok(empty.inner)
     }
@@ -326,7 +327,7 @@ where
             let client = Arc::clone(&self.client);
             let pool = Arc::new(NoopTransactionPool::default());
             task::spawn_blocking(move || {
-                let payload = build(config, client, pool, None.into_iter());
+                let payload = build(config, client, pool, None);
                 let _ = tx.send(payload);
             });
 
@@ -503,7 +504,7 @@ where
             config,
             Arc::clone(&self.client),
             Arc::clone(&self.pool),
-            bundles.into_iter(),
+            bundles,
             incoming,
             invalidated,
         ))
@@ -519,7 +520,7 @@ fn build<Client, P, I>(
 where
     Client: StateProviderFactory,
     P: TransactionPool,
-    I: Iterator<Item = (BundleId, BundleCompact)>,
+    I: IntoIterator<Item = (BundleId, BundleCompact)>,
 {
     let state = client.state_by_block_hash(config.parent.hash)?;
     let state = State::new(state);
@@ -535,7 +536,7 @@ fn build_on_state<S, P, I>(
 where
     S: StateProvider,
     P: TransactionPool,
-    I: Iterator<Item = (BundleId, BundleCompact)>,
+    I: IntoIterator<Item = (BundleId, BundleCompact)>,
 {
     let state = Arc::new(state);
     let mut db = CacheDB::new(Arc::clone(&state));
@@ -585,7 +586,7 @@ where
             &cfg_env,
             &block_env,
             cumulative_gas_used,
-            bundle.clone().into_iter(),
+            bundle.clone(),
         );
         match execution {
             Ok(execution) => {
@@ -621,7 +622,7 @@ where
             &cfg_env,
             &block_env,
             cumulative_gas_used,
-            Some(recovered_tx.clone()).into_iter(),
+            Some(recovered_tx.clone()),
         );
         match execution {
             Ok(execution) => {
@@ -670,7 +671,7 @@ where
             &cfg_env,
             &block_env,
             cumulative_gas_used,
-            Some(payment_tx.clone()).into_iter(),
+            Some(payment_tx.clone()),
         )
         .map_err(PayloadBuilderError::EvmExecutionError)?;
         cumulative_gas_used = execution.cumulative_gas_used;
@@ -723,7 +724,7 @@ fn execute<S, I>(
 ) -> Result<Execution, EVMError<RethError>>
 where
     S: StateProvider,
-    I: Iterator<Item = TransactionSignedEcRecovered>,
+    I: IntoIterator<Item = TransactionSignedEcRecovered>,
 {
     let block_num = block_env.number.to::<u64>();
 
@@ -972,14 +973,8 @@ mod tests {
         );
 
         // execute the transfer transaction
-        let execution = execute(
-            &mut db,
-            &cfg_env,
-            &block_env,
-            0,
-            Some(transfer_tx).into_iter(),
-        )
-        .expect("execution doesn't fail");
+        let execution = execute(&mut db, &cfg_env, &block_env, 0, Some(transfer_tx))
+            .expect("execution doesn't fail");
         let Execution {
             post_state,
             cumulative_gas_used,
@@ -1073,7 +1068,7 @@ mod tests {
             sender_nonce,
         );
 
-        let execution = execute(&mut db, &cfg_env, &block_env, 0, Some(call_tx).into_iter())
+        let execution = execute(&mut db, &cfg_env, &block_env, 0, Some(call_tx))
             .expect("execution doesn't fail");
         let Execution {
             post_state,
