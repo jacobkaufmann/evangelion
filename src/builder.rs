@@ -47,6 +47,7 @@ use reth_transaction_pool::{noop::NoopTransactionPool, TransactionPool};
 use tokio::{
     sync::{broadcast, mpsc, oneshot},
     task,
+    time::{sleep, Sleep},
 };
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tokio_util::time::DelayQueue;
@@ -132,6 +133,7 @@ struct JobConfig {
 /// a build job scoped to `config`
 pub struct Job<Client, Pool> {
     config: JobConfig,
+    deadline: Pin<Box<Sleep>>,
     client: Arc<Client>,
     pool: Arc<Pool>,
     bundles: HashMap<BundleId, BundleCompact>,
@@ -144,6 +146,7 @@ pub struct Job<Client, Pool> {
 impl<Client, Pool> Job<Client, Pool> {
     fn new<I: IntoIterator<Item = Bundle>>(
         config: JobConfig,
+        deadline: Pin<Box<Sleep>>,
         client: Arc<Client>,
         pool: Arc<Pool>,
         bundles: I,
@@ -159,6 +162,7 @@ impl<Client, Pool> Job<Client, Pool> {
 
         Self {
             config,
+            deadline,
             client,
             pool,
             bundles,
@@ -181,6 +185,11 @@ where
         let config = self.config.clone();
 
         let this = self.get_mut();
+
+        // check whether the deadline for the job expired
+        if this.deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(()));
+        }
 
         // incorporate new incoming bundles
         let mut num_incoming_bundles = 0;
@@ -348,12 +357,14 @@ where
 
 #[derive(Clone, Debug)]
 pub struct BuilderConfig {
+    pub deadline: Duration,
     pub extra_data: u128,
     pub wallet: LocalWallet,
 }
 
 pub struct Builder<Client, Pool> {
     chain: Arc<ChainSpec>,
+    deadline: Duration,
     wallet: LocalWallet,
     extra_data: u128,
     client: Arc<Client>,
@@ -380,6 +391,7 @@ where
 
         Self {
             chain,
+            deadline: config.deadline,
             wallet: config.wallet,
             extra_data: config.extra_data,
             client,
@@ -483,10 +495,12 @@ where
 
         let parent = Arc::new(latest.header.seal_slow());
         let config = JobConfig {
+            attributes,
             chain: Arc::clone(&self.chain),
             parent,
-            attributes,
         };
+
+        let deadline = Box::pin(sleep(self.deadline));
 
         // collect eligible bundles from the pool
         //
@@ -502,6 +516,7 @@ where
 
         Ok(Job::new(
             config,
+            deadline,
             Arc::clone(&self.client),
             Arc::clone(&self.pool),
             bundles,
