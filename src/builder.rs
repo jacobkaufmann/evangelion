@@ -578,11 +578,13 @@ where
         //
         // NOTE: we will be able to refactor to do rollbacks after the following is merged:
         // https://github.com/paradigmxyz/reth/pull/3512
-        let mut tmp_db = db.clone();
+        let mut execution_db = db.clone();
+        let mut execution_post_state = post_state.clone();
 
         let mut bundle = bundle.0;
         let execution = execute(
-            &mut tmp_db,
+            &mut execution_db,
+            &mut execution_post_state,
             &cfg_env,
             &block_env,
             cumulative_gas_used,
@@ -593,9 +595,9 @@ where
                 coinbase_payment += execution.coinbase_payment;
                 cumulative_gas_used = execution.cumulative_gas_used;
                 txs.append(&mut bundle);
-                post_state.extend(execution.post_state);
 
-                db = tmp_db;
+                db = execution_db;
+                post_state = execution_post_state;
             }
             Err(_) => continue,
         }
@@ -619,6 +621,7 @@ where
         // NOTE: we do not need to clone the DB here as we do for bundle execution
         let execution = execute(
             &mut db,
+            &mut post_state,
             &cfg_env,
             &block_env,
             cumulative_gas_used,
@@ -629,7 +632,6 @@ where
                 coinbase_payment += execution.coinbase_payment;
                 cumulative_gas_used = execution.cumulative_gas_used;
                 txs.push(recovered_tx);
-                post_state.extend(execution.post_state);
             }
             // if we have any transaction error other than the nonce being too low, then we mark
             // the transaction invalid
@@ -668,6 +670,7 @@ where
         // if the payment transaction fails, then the entire payload build fails
         let execution = execute(
             &mut db,
+            &mut post_state,
             &cfg_env,
             &block_env,
             cumulative_gas_used,
@@ -676,7 +679,6 @@ where
         .map_err(PayloadBuilderError::EvmExecutionError)?;
         cumulative_gas_used = execution.cumulative_gas_used;
         txs.push(payment_tx);
-        post_state.extend(execution.post_state);
     }
 
     // NOTE: here we assume post-shanghai
@@ -710,13 +712,13 @@ where
 
 #[derive(Clone, Debug)]
 struct Execution {
-    post_state: PostState,
     cumulative_gas_used: u64,
     coinbase_payment: U256,
 }
 
 fn execute<S, I>(
     db: &mut CacheDB<Arc<State<S>>>,
+    post_state: &mut PostState,
     cfg_env: &CfgEnv,
     block_env: &BlockEnv,
     mut cumulative_gas_used: u64,
@@ -731,8 +733,6 @@ where
     // determine the initial balance of the account at the coinbase address
     let coinbase_acct = db.basic(block_env.coinbase).map_err(EVMError::Database)?;
     let initial_coinbase_balance = coinbase_acct.map_or(U256::ZERO, |acct| acct.balance);
-
-    let mut post_state = PostState::default();
 
     for tx in txs {
         // construct EVM
@@ -749,7 +749,7 @@ where
         let ResultAndState { result, state } = evm.transact()?;
 
         // commit changes to DB and post state
-        commit_state_changes(db, &mut post_state, block_num, state, true);
+        commit_state_changes(db, post_state, block_num, state, true);
 
         cumulative_gas_used += result.gas_used();
 
@@ -769,7 +769,6 @@ where
         compute_coinbase_payment(&block_env.coinbase, initial_coinbase_balance, &post_state);
 
     Ok(Execution {
-        post_state,
         cumulative_gas_used,
         coinbase_payment,
     })
@@ -950,6 +949,7 @@ mod tests {
 
         let state = State::new(state);
         let mut db = CacheDB::new(Arc::new(state));
+        let mut post_state = PostState::default();
 
         // builder will be the coinbase (i.e. beneficiary)
         let builder_wallet = LocalWallet::new(&mut rand::thread_rng());
@@ -973,10 +973,16 @@ mod tests {
         );
 
         // execute the transfer transaction
-        let execution = execute(&mut db, &cfg_env, &block_env, 0, Some(transfer_tx))
-            .expect("execution doesn't fail");
+        let execution = execute(
+            &mut db,
+            &mut post_state,
+            &cfg_env,
+            &block_env,
+            0,
+            Some(transfer_tx),
+        )
+        .expect("execution doesn't fail");
         let Execution {
-            post_state,
             cumulative_gas_used,
             coinbase_payment,
         } = execution;
@@ -1046,6 +1052,7 @@ mod tests {
 
         let state = State::new(state);
         let mut db = CacheDB::new(Arc::new(state));
+        let mut post_state = PostState::default();
 
         // builder will be the coinbase (i.e. beneficiary)
         let builder_wallet = LocalWallet::new(&mut rand::thread_rng());
@@ -1068,13 +1075,18 @@ mod tests {
             sender_nonce,
         );
 
-        let execution = execute(&mut db, &cfg_env, &block_env, 0, Some(call_tx))
-            .expect("execution doesn't fail");
+        let execution = execute(
+            &mut db,
+            &mut post_state,
+            &cfg_env,
+            &block_env,
+            0,
+            Some(call_tx),
+        )
+        .expect("execution doesn't fail");
         let Execution {
-            post_state,
             coinbase_payment,
             cumulative_gas_used,
-            ..
         } = execution;
 
         // check coinbase payment
