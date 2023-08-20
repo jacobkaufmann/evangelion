@@ -769,7 +769,7 @@ where
 
     // compute the coinbase payment
     let coinbase_payment =
-        compute_coinbase_payment(&block_env.coinbase, initial_coinbase_balance, &post_state);
+        compute_coinbase_payment(&block_env.coinbase, initial_coinbase_balance, post_state);
 
     Ok(Execution {
         cumulative_gas_used,
