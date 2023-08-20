@@ -611,8 +611,11 @@ where
     // TODO: support more sophisticated mixtures of bundles and transactions
     let mut mempool_txs = pool.best_transactions_with_base_fee(base_fee);
     while let Some(tx) = mempool_txs.next() {
-        // check gas
+        // if we don't have sufficient gas for the transaction, then we skip past it. we also mark
+        // the transaction invalid, which will remove any subsequent transactions that depend on it
+        // from the iterator.
         if cumulative_gas_used + tx.gas_limit() > execution_gas_limit {
+            mempool_txs.mark_invalid(&tx);
             continue;
         }
 
