@@ -119,7 +119,7 @@ struct Payload {
 #[derive(Clone, Debug)]
 struct PayloadAttributes {
     inner: PayloadBuilderAttributes,
-    extra_data: u128,
+    extra_data: Bytes,
     wallet: LocalWallet,
 }
 
@@ -358,7 +358,7 @@ where
 #[derive(Clone, Debug)]
 pub struct BuilderConfig {
     pub deadline: Duration,
-    pub extra_data: u128,
+    pub extra_data: Bytes,
     pub wallet: LocalWallet,
 }
 
@@ -366,7 +366,7 @@ pub struct Builder<Client, Pool> {
     chain: Arc<ChainSpec>,
     deadline: Duration,
     wallet: LocalWallet,
-    extra_data: u128,
+    extra_data: Bytes,
     client: Arc<Client>,
     pool: Arc<Pool>,
     bundle_pool: Arc<Mutex<BundlePool>>,
@@ -489,7 +489,7 @@ where
 
         let attributes = PayloadAttributes {
             inner: attributes,
-            extra_data: self.extra_data,
+            extra_data: self.extra_data.clone(),
             wallet: self.wallet.clone(),
         };
 
@@ -795,7 +795,7 @@ where
 fn package_block<S: StateProvider>(
     state: S,
     attributes: &PayloadBuilderAttributes,
-    extra_data: u128,
+    extra_data: Bytes,
     block_env: &BlockEnv,
     txs: Vec<TransactionSigned>,
     post_state: PostState,
@@ -831,7 +831,7 @@ fn package_block<S: StateProvider>(
         base_fee_per_gas: Some(base_fee),
         blob_gas_used: None,
         excess_blob_gas: None,
-        extra_data: extra_data.to_le_bytes().into(),
+        extra_data,
     };
 
     let block = Block {
