@@ -25,7 +25,7 @@ use reth_payload_builder::{
 use reth_primitives::{
     constants::{BEACON_NONCE, EMPTY_OMMER_ROOT},
     proofs, Block, BlockNumber, Bytes, ChainSpec, Header, IntoRecoveredTransaction, Receipt,
-    SealedBlock, SealedHeader, TransactionSigned, TransactionSignedEcRecovered, U256,
+    SealedHeader, TransactionSigned, TransactionSignedEcRecovered, U256,
 };
 use reth_provider::{
     BlockReaderIdExt, CanonStateNotification, PostState, StateProvider, StateProviderFactory,
@@ -108,6 +108,71 @@ impl BundlePool {
     pub fn maintain(&mut self, _event: CanonStateNotification) -> Vec<BundleId> {
         // remove all bundles
         self.0.drain().map(|bundle| bundle.id).collect()
+    }
+}
+
+struct UnpackagedPayload<S: StateProvider> {
+    attributes: PayloadBuilderAttributes,
+    block_env: BlockEnv,
+    state: Arc<State<S>>,
+    post_state: PostState,
+    extra_data: u128,
+    txs: Vec<TransactionSigned>,
+    bundles: HashSet<BundleId>,
+    cumulative_gas_used: u64,
+    proposer_payment: U256,
+}
+
+impl<S: StateProvider> UnpackagedPayload<S> {
+    pub fn package(self) -> Result<Payload, PayloadBuilderError> {
+        let base_fee = self.block_env.basefee.to::<u64>();
+        let block_num = self.block_env.number.to::<u64>();
+        let block_gas_limit: u64 = self.block_env.gas_limit.try_into().unwrap_or(u64::MAX);
+
+        // compute accumulators
+        let receipts_root = self.post_state.receipts_root(block_num);
+        let logs_bloom = self.post_state.logs_bloom(block_num);
+        let transactions_root = proofs::calculate_transaction_root(&self.txs);
+        let withdrawals_root = proofs::calculate_withdrawals_root(&self.attributes.withdrawals);
+        let state_root = self.state.state().state_root(self.post_state)?;
+
+        let header = Header {
+            parent_hash: self.attributes.parent,
+            ommers_hash: EMPTY_OMMER_ROOT,
+            beneficiary: self.block_env.coinbase,
+            state_root,
+            transactions_root,
+            receipts_root,
+            withdrawals_root: Some(withdrawals_root),
+            logs_bloom,
+            difficulty: U256::ZERO,
+            number: block_num,
+            gas_limit: block_gas_limit,
+            gas_used: self.cumulative_gas_used,
+            timestamp: self.attributes.timestamp,
+            mix_hash: self.attributes.prev_randao,
+            nonce: BEACON_NONCE,
+            base_fee_per_gas: Some(base_fee),
+            blob_gas_used: None,
+            excess_blob_gas: None,
+            extra_data: self.extra_data.to_le_bytes().into(),
+        };
+
+        let block = Block {
+            header,
+            body: self.txs,
+            ommers: vec![],
+            withdrawals: Some(self.attributes.withdrawals.clone()),
+        };
+        let block = block.seal_slow();
+
+        let payload = BuiltPayload::new(self.attributes.id, block, self.proposer_payment);
+        let payload = Payload {
+            inner: Arc::new(payload),
+            bundles: self.bundles,
+        };
+
+        Ok(payload)
     }
 }
 
@@ -539,7 +604,8 @@ where
 {
     let state = client.state_by_block_hash(config.parent.hash)?;
     let state = State::new(state);
-    build_on_state(config, state, pool, bundles)
+    let unpackaged_payload = build_on_state(config, state, pool, bundles)?;
+    unpackaged_payload.package()
 }
 
 fn build_on_state<S, P, I>(
@@ -547,7 +613,7 @@ fn build_on_state<S, P, I>(
     state: State<S>,
     pool: P,
     bundles: I,
-) -> Result<Payload, PayloadBuilderError>
+) -> Result<UnpackagedPayload<S>, PayloadBuilderError>
 where
     S: StateProvider,
     P: TransactionPool,
@@ -709,23 +775,17 @@ where
         increment_account_balance(&mut db, &mut post_state, block_num, address, increment)?;
     }
 
-    let block = package_block(
-        state.state(),
-        &config.attributes.inner,
-        config.attributes.extra_data,
-        &block_env,
-        txs.into_iter().map(|tx| tx.into_signed()).collect(),
+    Ok(UnpackagedPayload {
+        attributes: config.attributes.inner,
+        block_env,
+        state,
         post_state,
-        cumulative_gas_used,
-    )?;
-
-    let payload = BuiltPayload::new(config.attributes.inner.id, block, proposer_payment);
-    let payload = Payload {
-        inner: Arc::new(payload),
+        extra_data: config.attributes.extra_data,
+        txs: txs.into_iter().map(|tx| tx.into_signed()).collect(),
         bundles: bundle_ids,
-    };
-
-    Ok(payload)
+        cumulative_gas_used,
+        proposer_payment,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -790,57 +850,6 @@ where
         cumulative_gas_used,
         coinbase_payment,
     })
-}
-
-fn package_block<S: StateProvider>(
-    state: S,
-    attributes: &PayloadBuilderAttributes,
-    extra_data: Bytes,
-    block_env: &BlockEnv,
-    txs: Vec<TransactionSigned>,
-    post_state: PostState,
-    cumulative_gas_used: u64,
-) -> Result<SealedBlock, PayloadBuilderError> {
-    let base_fee = block_env.basefee.to::<u64>();
-    let block_num = block_env.number.to::<u64>();
-    let block_gas_limit: u64 = block_env.gas_limit.try_into().unwrap_or(u64::MAX);
-
-    // compute accumulators
-    let receipts_root = post_state.receipts_root(block_num);
-    let logs_bloom = post_state.logs_bloom(block_num);
-    let transactions_root = proofs::calculate_transaction_root(&txs);
-    let withdrawals_root = proofs::calculate_withdrawals_root(&attributes.withdrawals);
-    let state_root = state.state_root(post_state)?;
-
-    let header = Header {
-        parent_hash: attributes.parent,
-        ommers_hash: EMPTY_OMMER_ROOT,
-        beneficiary: block_env.coinbase,
-        state_root,
-        transactions_root,
-        receipts_root,
-        withdrawals_root: Some(withdrawals_root),
-        logs_bloom,
-        difficulty: U256::ZERO,
-        number: block_num,
-        gas_limit: block_gas_limit,
-        gas_used: cumulative_gas_used,
-        timestamp: attributes.timestamp,
-        mix_hash: attributes.prev_randao,
-        nonce: BEACON_NONCE,
-        base_fee_per_gas: Some(base_fee),
-        blob_gas_used: None,
-        excess_blob_gas: None,
-        extra_data,
-    };
-
-    let block = Block {
-        header,
-        body: txs,
-        ommers: vec![],
-        withdrawals: Some(attributes.withdrawals.clone()),
-    };
-    Ok(block.seal_slow())
 }
 
 /// Computes the payment to `coinbase` based on `initial_balance` and `post_state`.
