@@ -23,7 +23,7 @@ use reth_payload_builder::{
     PayloadJob, PayloadJobGenerator,
 };
 use reth_primitives::{
-    constants::{BEACON_NONCE, EMPTY_OMMER_ROOT},
+    constants::{BEACON_NONCE, EMPTY_OMMER_ROOT, MAXIMUM_EXTRA_DATA_SIZE},
     proofs, Block, BlockNumber, Bytes, ChainSpec, Header, IntoRecoveredTransaction, Receipt,
     SealedHeader, TransactionSigned, TransactionSignedEcRecovered, U256,
 };
@@ -116,7 +116,7 @@ struct UnpackagedPayload<S: StateProvider> {
     block_env: BlockEnv,
     state: Arc<State<S>>,
     post_state: PostState,
-    extra_data: u128,
+    extra_data: Bytes,
     txs: Vec<TransactionSigned>,
     bundles: HashSet<BundleId>,
     cumulative_gas_used: u64,
@@ -135,6 +135,13 @@ impl<S: StateProvider> UnpackagedPayload<S> {
         let transactions_root = proofs::calculate_transaction_root(&self.txs);
         let withdrawals_root = proofs::calculate_withdrawals_root(&self.attributes.withdrawals);
         let state_root = self.state.state().state_root(self.post_state)?;
+
+        if self.extra_data.len() > MAXIMUM_EXTRA_DATA_SIZE {
+            return Err(PayloadBuilderError::Internal(RethError::Custom(
+                "Unpackaged Payload extradata size exceeds MAXIMUM_EXTRA_DATA_SIZE bytes limit"
+                    .into(),
+            )));
+        }
 
         let header = Header {
             parent_hash: self.attributes.parent,
@@ -155,7 +162,7 @@ impl<S: StateProvider> UnpackagedPayload<S> {
             base_fee_per_gas: Some(base_fee),
             blob_gas_used: None,
             excess_blob_gas: None,
-            extra_data: self.extra_data.to_le_bytes().into(),
+            extra_data: self.extra_data,
         };
 
         let block = Block {
@@ -552,6 +559,13 @@ where
             )));
         }
 
+        // extra data must be less than 32 bytes
+        if self.extra_data.len() > MAXIMUM_EXTRA_DATA_SIZE {
+            return Err(PayloadBuilderError::Internal(RethError::Custom(
+                "extradata size exceeds MAXIMUM_EXTRA_DATA_SIZE bytes limit".into(),
+            )));
+        }
+
         let attributes = PayloadAttributes {
             inner: attributes,
             extra_data: self.extra_data.clone(),
@@ -644,6 +658,13 @@ where
     let mut cumulative_gas_used = 0;
     let mut txs = Vec::new();
     let mut bundle_ids = HashSet::new();
+
+    // extra data must be less than 32 bytes
+    if config.attributes.extra_data.len() > MAXIMUM_EXTRA_DATA_SIZE {
+        return Err(PayloadBuilderError::Internal(RethError::Custom(
+            "extradata size exceeds MAXIMUM_EXTRA_DATA_SIZE bytes limit".into(),
+        )));
+    }
 
     // execute bundles
     for (id, bundle) in bundles {
