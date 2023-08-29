@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::matches;
-use std::ops::RangeInclusive;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::bundle::{pool::BundlePool, Bundle, BundleCompact, BundleId};
 
 use ethers::{
     signers::{LocalWallet, Signer},
@@ -51,65 +52,6 @@ use tokio::{
 };
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tokio_util::time::DelayQueue;
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct BundleCompact(Vec<TransactionSignedEcRecovered>);
-
-impl BundleCompact {
-    /// returns whether `self` conflicts with `other` in the sense that both cannot be executed
-    pub fn conflicts(&self, other: &Self) -> bool {
-        let hashes = self
-            .0
-            .iter()
-            .map(|tx| tx.hash_ref())
-            .collect::<HashSet<_>>();
-        let other_hashes = other
-            .0
-            .iter()
-            .map(|tx| tx.hash_ref())
-            .collect::<HashSet<_>>();
-        !hashes.is_disjoint(&other_hashes)
-    }
-}
-
-type BundleId = u64;
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct Bundle {
-    pub id: BundleId,
-    pub txs: Vec<TransactionSignedEcRecovered>,
-    pub block_num: BlockNumber,
-    pub eligibility: RangeInclusive<u64>,
-}
-
-#[derive(Default)]
-pub struct BundlePool(HashSet<Bundle>);
-
-impl BundlePool {
-    /// returns all bundles eligible w.r.t. time `now` and canonical chain tip `block`
-    pub fn eligible(&self, block: BlockNumber, now: SystemTime) -> Vec<Bundle> {
-        let now = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
-        self.0
-            .iter()
-            .filter(|bundle| bundle.eligibility.contains(&now) && bundle.block_num == block)
-            .cloned()
-            .collect()
-    }
-
-    /// removes all bundles whose eligibility expires w.r.t. time `now`
-    pub fn tick(&mut self, now: SystemTime) {
-        let now = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
-        self.0.retain(|bundle| *bundle.eligibility.end() >= now);
-    }
-
-    /// maintains the pool based on updates to the canonical state.
-    ///
-    /// returns the IDs of the bundles removed from the pool.
-    pub fn maintain(&mut self, _event: CanonStateNotification) -> Vec<BundleId> {
-        // remove all bundles
-        self.0.drain().map(|bundle| bundle.id).collect()
-    }
-}
 
 struct UnpackagedPayload<S: StateProvider> {
     attributes: PayloadBuilderAttributes,
