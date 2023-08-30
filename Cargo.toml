@@ -12,15 +12,15 @@ eyre = "0.6.8"
 futures-util = "0.3.28"
 mev-rs = { git = "https://github.com/ralexstokes/mev-rs", rev = "db54c2d", features = ["serde"] }
 rand = "0.8.5"
-reth = { git = "https://github.com/paradigmxyz/reth.git", package = "reth", version = "0.1.0-alpha.7" }
-reth-interfaces = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-interfaces", version = "0.1.0-alpha.7" }
-reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-payload-builder", version = "0.1.0-alpha.7" }
-reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-primitives", version = "0.1.0-alpha.7" }
-reth-provider = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-provider", version = "0.1.0-alpha.7" }
-reth-revm = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm", version = "0.1.0-alpha.7" }
-reth-revm-primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm-primitives", version = "0.1.0-alpha.7" }
-reth-rpc-types = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-rpc-types", version = "0.1.0-alpha.7" }
-reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-transaction-pool", version = "0.1.0-alpha.7" }
+reth = { git = "https://github.com/paradigmxyz/reth.git", package = "reth", version = "0.1.0-alpha.8" }
+reth-interfaces = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-interfaces", version = "0.1.0-alpha.8" }
+reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-payload-builder", version = "0.1.0-alpha.8" }
+reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-primitives", version = "0.1.0-alpha.8" }
+reth-provider = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-provider", version = "0.1.0-alpha.8" }
+reth-revm = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm", version = "0.1.0-alpha.8" }
+reth-revm-primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm-primitives", version = "0.1.0-alpha.8" }
+reth-rpc-types = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-rpc-types", version = "0.1.0-alpha.8" }
+reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-transaction-pool", version = "0.1.0-alpha.8" }
 serde = { version = "1.0.187", features = ["std", "derive"] }
 ssz_rs = "0.9.0"
 tokio = "1.29.1"
@@ -34,4 +34,4 @@ revm = { git = "https://github.com/bluealloy/revm/", branch = "release/v25" }
 revm-primitives = { git = "https://github.com/bluealloy/revm/", branch = "release/v25" }
 
 [dev-dependencies]
-reth-provider = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-provider", version = "0.1.0-alpha.7", features = ["test-utils"] }
+reth-provider = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-provider", version = "0.1.0-alpha.8", features = ["test-utils"] }

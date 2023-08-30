@@ -1,4 +1,5 @@
 mod builder;
+mod bundle;
 
 use std::collections::HashSet;
 use std::ops::Deref;
