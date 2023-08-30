@@ -97,6 +97,7 @@ impl<S: StateProvider> UnpackagedPayload<S> {
             base_fee_per_gas: Some(base_fee),
             blob_gas_used: None,
             excess_blob_gas: None,
+            parent_beacon_block_root: None,
             extra_data: self.extra_data.to_le_bytes().into(),
         };
 
