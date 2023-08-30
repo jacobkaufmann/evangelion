@@ -116,7 +116,7 @@ struct UnpackagedPayload<S: StateProvider> {
     block_env: BlockEnv,
     state: Arc<State<S>>,
     post_state: PostState,
-    extra_data: u128,
+    extra_data: Bytes,
     txs: Vec<TransactionSigned>,
     bundles: HashSet<BundleId>,
     cumulative_gas_used: u64,
@@ -155,7 +155,7 @@ impl<S: StateProvider> UnpackagedPayload<S> {
             base_fee_per_gas: Some(base_fee),
             blob_gas_used: None,
             excess_blob_gas: None,
-            extra_data: self.extra_data.to_le_bytes().into(),
+            extra_data: self.extra_data,
         };
 
         let block = Block {
@@ -184,7 +184,7 @@ struct Payload {
 #[derive(Clone, Debug)]
 struct PayloadAttributes {
     inner: PayloadBuilderAttributes,
-    extra_data: u128,
+    extra_data: Bytes,
     wallet: LocalWallet,
 }
 
@@ -423,7 +423,7 @@ where
 #[derive(Clone, Debug)]
 pub struct BuilderConfig {
     pub deadline: Duration,
-    pub extra_data: u128,
+    pub extra_data: Bytes,
     pub wallet: LocalWallet,
 }
 
@@ -431,8 +431,9 @@ pub struct Builder<Client, Pool> {
     chain: Arc<ChainSpec>,
     deadline: Duration,
     wallet: LocalWallet,
-    extra_data: u128,
+    extra_data: Bytes,
     client: Arc<Client>,
+    jobs: mpsc::UnboundedSender<PayloadBuilderAttributes>,
     pool: Arc<Pool>,
     bundle_pool: Arc<Mutex<BundlePool>>,
     incoming: broadcast::Sender<(BundleId, BlockNumber, BundleCompact)>,
@@ -444,7 +445,13 @@ where
     Client: StateProviderFactory + Unpin,
     Pool: TransactionPool + Unpin,
 {
-    pub fn new(config: BuilderConfig, chain: ChainSpec, client: Client, pool: Pool) -> Self {
+    pub fn new(
+        config: BuilderConfig,
+        chain: ChainSpec,
+        client: Client,
+        jobs: mpsc::UnboundedSender<PayloadBuilderAttributes>,
+        pool: Pool,
+    ) -> Self {
         let chain = Arc::new(chain);
         let client = Arc::new(client);
         let pool = Arc::new(pool);
@@ -460,6 +467,7 @@ where
             wallet: config.wallet,
             extra_data: config.extra_data,
             client,
+            jobs,
             pool,
             bundle_pool,
             incoming,
@@ -554,7 +562,7 @@ where
 
         let attributes = PayloadAttributes {
             inner: attributes,
-            extra_data: self.extra_data,
+            extra_data: self.extra_data.clone(),
             wallet: self.wallet.clone(),
         };
 
@@ -578,6 +586,9 @@ where
 
         let incoming = BroadcastStream::new(self.incoming.subscribe()).fuse();
         let invalidated = BroadcastStream::new(self.invalidated.subscribe()).fuse();
+
+        // alert about new payload job
+        let _ = self.jobs.send(config.attributes.inner.clone());
 
         Ok(Job::new(
             config,
