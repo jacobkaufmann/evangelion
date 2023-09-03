@@ -195,7 +195,7 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                             }
                         }
                     }
-                    Some(mut attrs) = jobs_rx.recv() => {
+                    Some((mut attrs, cancel)) = jobs_rx.recv() => {
                         let mut payload_id = attrs.id;
                         let payload_slot = clock.slot_at_time(attrs.timestamp).expect("beyond genesis");
 
@@ -204,7 +204,13 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                             continue;
                         }
 
-                        tracing::info!(payload = %payload_id, slot = %payload_slot, "new payload job initiated");
+                        // cancel the job, since we only want to keep jobs that we initiated
+                        tracing::info!(
+                            payload = %payload_id,
+                            slot = %payload_slot,
+                            "cancelling non-mev-boost payload job"
+                        );
+                        cancel.cancel();
 
                         // look up the proposer preferences for the slot if available
                         tracing::info!(

@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::matches;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{self, AtomicBool},
+    Arc, Mutex,
+};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -138,10 +141,24 @@ struct JobConfig {
     chain: Arc<ChainSpec>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn cancel(&self) {
+        self.0.store(true, atomic::Ordering::Relaxed)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(atomic::Ordering::Relaxed)
+    }
+}
+
 /// a build job scoped to `config`
 pub struct Job<Client, Pool> {
     config: JobConfig,
     deadline: Pin<Box<Sleep>>,
+    cancel: Cancel,
     client: Arc<Client>,
     pool: Arc<Pool>,
     bundles: HashMap<BundleId, BundleCompact>,
@@ -152,9 +169,11 @@ pub struct Job<Client, Pool> {
 }
 
 impl<Client, Pool> Job<Client, Pool> {
+    #[allow(clippy::too_many_arguments)]
     fn new<I: IntoIterator<Item = Bundle>>(
         config: JobConfig,
         deadline: Pin<Box<Sleep>>,
+        cancel: Cancel,
         client: Arc<Client>,
         pool: Arc<Pool>,
         bundles: I,
@@ -171,6 +190,7 @@ impl<Client, Pool> Job<Client, Pool> {
         Self {
             config,
             deadline,
+            cancel,
             client,
             pool,
             bundles,
@@ -193,6 +213,11 @@ where
         let config = self.config.clone();
 
         let this = self.get_mut();
+
+        // check whether the job was cancelled
+        if this.cancel.is_cancelled() {
+            return Poll::Ready(Ok(()));
+        }
 
         // check whether the deadline for the job expired
         if this.deadline.as_mut().poll(cx).is_ready() {
@@ -376,7 +401,7 @@ pub struct Builder<Client, Pool> {
     wallet: LocalWallet,
     extra_data: Bytes,
     client: Arc<Client>,
-    jobs: mpsc::UnboundedSender<PayloadBuilderAttributes>,
+    jobs: mpsc::UnboundedSender<(PayloadBuilderAttributes, Cancel)>,
     pool: Arc<Pool>,
     bundle_pool: Arc<Mutex<BundlePool>>,
     incoming: broadcast::Sender<(BundleId, BlockNumber, BundleCompact)>,
@@ -392,7 +417,7 @@ where
         config: BuilderConfig,
         chain: ChainSpec,
         client: Client,
-        jobs: mpsc::UnboundedSender<PayloadBuilderAttributes>,
+        jobs: mpsc::UnboundedSender<(PayloadBuilderAttributes, Cancel)>,
         pool: Pool,
     ) -> Self {
         let chain = Arc::new(chain);
@@ -517,6 +542,7 @@ where
         };
 
         let deadline = Box::pin(sleep(self.deadline));
+        let cancel = Cancel::default();
 
         // collect eligible bundles from the pool
         //
@@ -531,11 +557,14 @@ where
         let invalidated = BroadcastStream::new(self.invalidated.subscribe()).fuse();
 
         // alert about new payload job
-        let _ = self.jobs.send(config.attributes.inner.clone());
+        let _ = self
+            .jobs
+            .send((config.attributes.inner.clone(), cancel.clone()));
 
         Ok(Job::new(
             config,
             deadline,
+            cancel,
             Arc::clone(&self.client),
             Arc::clone(&self.pool),
             bundles,
