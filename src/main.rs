@@ -20,6 +20,7 @@ use ethereum_consensus::{
     state_transition::Context,
 };
 use ethers::signers::{LocalWallet, Signer};
+use futures_util::StreamExt;
 use mev_rs::{
     blinded_block_relayer::{BlindedBlockRelayer, Client as RelayClient},
     signing::sign_builder_message,
@@ -41,6 +42,7 @@ use tokio::{
     sync::mpsc,
     time::{interval, interval_at},
 };
+use tokio_util::time::DelayQueue;
 use url::Url;
 
 use builder::{Builder, BuilderConfig};
@@ -80,7 +82,7 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
         Pool: reth::transaction_pool::TransactionPool + Unpin + 'static,
         Tasks: reth::tasks::TaskSpawner + Clone + Unpin + 'static,
     {
-        // only allow sepolia
+        // NOTE: only allow sepolia
         assert_eq!(chain_spec.chain(), Chain::sepolia());
 
         // beacon client
@@ -133,8 +135,6 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
         executor.spawn_critical("payload builder service", Box::pin(payload_service));
 
         // spawn task to participate in mev-boost auction
-        //
-        // we need to clone the payload builder handle to gain access to the underlying builder
         tracing::info!("spawning mev-boost auction");
         let other_payload_builder = payload_builder.clone();
         let other_executor = executor.clone();
@@ -143,10 +143,7 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
             let validators = Arc::new(ValidatorRegistry::new(beacon_client.deref().clone()));
             let scheduler = Arc::new(ProposerScheduler::new(beacon_client.deref().clone()));
 
-
             let context = Arc::new(Context::for_sepolia());
-
-            // time related values
             let clock = clock::for_sepolia();
 
             // refresh the consensus and mev-boost info each epoch
@@ -154,8 +151,9 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
             let validator_info_refresh_interval = Duration::from_secs(seconds_per_epoch);
             let mut validator_info_refresh_interval = interval(validator_info_refresh_interval);
 
-            // TODO: clean up periodically, otherwise grows indefinitely
+            // keep track of the jobs that we initiate
             let mut initiated_jobs = HashSet::new();
+            let mut jobs_removal_queue = DelayQueue::new();
 
             loop {
                 tokio::select! {
@@ -205,16 +203,15 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                         }
 
                         // cancel the job, since we only want to keep jobs that we initiated
-                        tracing::info!(
-                            payload = %payload_id,
+                        tracing::debug!(
                             slot = %payload_slot,
+                            payload = %payload_id,
                             "cancelling non-mev-boost payload job"
                         );
                         cancel.cancel();
 
                         // look up the proposer preferences for the slot if available
                         tracing::info!(
-                            payload = %payload_id,
                             slot = %payload_slot,
                             "looking up mev-boost registration for proposer"
                         );
@@ -222,7 +219,6 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                             Ok(proposer) => proposer,
                             Err(err) => {
                                 tracing::warn!(
-                                    payload = %payload_id,
                                     slot = %payload_slot,
                                     "unable to retrieve proposer for slot {err}, not bidding for slot"
                                 );
@@ -232,16 +228,16 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                         let prefs = match validators.get_preferences(&proposer) {
                             Some(prefs) => {
                                 tracing::info!(
-                                    payload = %payload_id,
                                     slot = %payload_slot,
+                                    proposer = %proposer,
                                     "found mev-boost registration for proposer {prefs:?}"
                                 );
                                 prefs
                             }
                             None => {
                                 tracing::info!(
-                                    payload = %payload_id,
                                     slot = %payload_slot,
+                                    proposer = %proposer,
                                     "mev-boost registration not found for proposer, not bidding for slot"
                                 );
                                 continue;
@@ -263,28 +259,34 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                                 parent_beacon_block_root: None,
                             };
                             attrs = PayloadBuilderAttributes::new(attrs.parent, attributes);
+                            payload_id = attrs.payload_id();
 
-                            match other_payload_builder.new_payload(attrs.clone()).await {
-                                Ok(id) => payload_id = id,
-                                Err(err) => {
-                                    tracing::error!(
-                                        slot = %payload_slot,
-                                        "unable to initiate new payload job {err}, not bidding for slot"
-                                    );
-                                    continue;
-                                }
+                            // if we already initiated a job with identical attributes, then move on
+                            if initiated_jobs.contains(&payload_id) {
+                                continue;
                             }
+
+                            if let Err(err) = other_payload_builder.new_payload(attrs.clone()).await {
+                                tracing::error!(
+                                    slot = %payload_slot,
+                                    "unable to initiate new payload job {err}, not bidding for slot"
+                                );
+                                continue;
+                            }
+
                             initiated_jobs.insert(payload_id);
+                            jobs_removal_queue.insert(payload_id, Duration::from_secs(60));
                             tracing::info!(
-                                payload = %payload_id,
                                 slot = %payload_slot,
+                                proposer = %proposer,
+                                payload = %payload_id,
                                 "successfully initiated new payload job for mev-boost auction"
                             );
                         }
 
                         // spawn a task to periodically poll the payload job and submit bids to the
                         // mev-boost relay
-                        let proposer_pk = Arc::new(proposer);
+                        let proposer = Arc::new(proposer);
                         let proposer_fee_recipient = attrs.suggested_fee_recipient;
                         let inner_payload_builder = other_payload_builder.clone();
                         let inner_relay_client = Arc::clone(&relay_client);
@@ -310,7 +312,9 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                                     Some(Ok(payload)) => {
                                         if payload.fees() > highest_bid {
                                             tracing::info!(
-                                                payload = %payload.id(),
+                                                slot = %payload_slot,
+                                                proposer = %proposer,
+                                                payload = %payload_id,
                                                 "submitting bid for payload with higher value {} to relay",
                                                 payload.fees()
                                             );
@@ -320,7 +324,7 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                                                 &payload,
                                                 payload_slot,
                                                 inner_bls_pk.clone(),
-                                                proposer_pk.clone(),
+                                                proposer.clone(),
                                                 to_bytes20(proposer_fee_recipient)
                                             );
                                             let execution_payload = block_to_execution_payload(payload.block());
@@ -337,12 +341,16 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
 
                                             if let Err(err) = inner_relay_client.submit_bid(&submission).await {
                                                 tracing::warn!(
+                                                    slot = %payload_slot,
+                                                    proposer = %proposer,
                                                     payload = %payload_id,
                                                     "unable to submit higher bid to relay {err}"
                                                 );
                                             } else {
                                                 highest_bid = payload.fees();
                                                 tracing::info!(
+                                                    slot = %payload_slot,
+                                                    proposer = %proposer,
                                                     payload = %payload_id,
                                                     "successfully submitted bid to relay with value {highest_bid}"
                                                 );
@@ -351,6 +359,8 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                                     }
                                     Some(Err(err)) => {
                                         tracing::warn!(
+                                            slot = %payload_slot,
+                                            proposer = %proposer,
                                             payload = %payload_id,
                                             "unable to retrieve best payload from build job {err}"
                                         );
@@ -359,6 +369,9 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                                 }
                             }
                         }));
+                    }
+                    Some(job) = jobs_removal_queue.next() => {
+                        initiated_jobs.remove(job.get_ref());
                     }
                 }
             }
