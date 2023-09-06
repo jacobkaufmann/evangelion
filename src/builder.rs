@@ -211,6 +211,7 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let config = self.config.clone();
+        let payload_id = config.attributes.inner.payload_id();
 
         let this = self.get_mut();
 
@@ -291,11 +292,11 @@ where
                             // cache the built payload
                             this.built_payloads.push(payload);
                         }
-                        Ok(Err(..)) => {
-                            // build task failed
+                        Ok(Err(err)) => {
+                            tracing::warn!(payload = %payload_id, "payload build failed {err}")
                         }
-                        Err(..) => {
-                            // `recv` failed
+                        Err(err) => {
+                            tracing::error!(payload = %payload_id, "payload task failed to complete {err}")
                         }
                     }
                 }
