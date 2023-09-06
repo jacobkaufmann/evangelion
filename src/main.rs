@@ -211,10 +211,6 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                         cancel.cancel();
 
                         // look up the proposer preferences for the slot if available
-                        tracing::info!(
-                            slot = %payload_slot,
-                            "looking up mev-boost registration for proposer"
-                        );
                         let proposer = match scheduler.get_proposer_for(payload_slot) {
                             Ok(proposer) => proposer,
                             Err(err) => {
@@ -365,7 +361,14 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                                             "unable to retrieve best payload from build job {err}"
                                         );
                                     }
-                                    None => {}
+                                    None => {
+                                        tracing::warn!(
+                                            slot = %payload_slot,
+                                            proposer = %proposer,
+                                            payload = %payload_id,
+                                            "payload not available for submission"
+                                        );
+                                    }
                                 }
                             }
                         }));
