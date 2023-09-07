@@ -292,7 +292,7 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                         let inner_bls_sk = Arc::clone(&bls_sk);
                         let inner_context = Arc::clone(&context);
                         other_executor.spawn(Box::pin(async move {
-                            // starting 500ms from now, poll the job every 500ms, and only poll for the duration of a slot
+                            // starting 500ms from now, poll the job every 500ms
                             let payload_poll_interval = Duration::from_millis(500);
                             let start = Instant::now() + payload_poll_interval;
                             let mut payload_poll_interval = interval_at(start.into(), payload_poll_interval);
@@ -302,7 +302,13 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
 
                             // TODO: watch auction so that we can terminate early and so that we
                             // can know whether we won or lost
+                            let start = Instant::now();
                             loop {
+                                // only poll the job for the duration of a slot
+                                if start.elapsed() > Duration::from_secs(SECONDS_PER_SLOT) {
+                                    break;
+                                }
+
                                 payload_poll_interval.tick().await;
 
                                 // poll the job for the best available payload
