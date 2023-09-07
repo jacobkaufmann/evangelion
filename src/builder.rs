@@ -423,11 +423,11 @@ pub struct Builder<Client, Pool> {
     wallet: LocalWallet,
     extra_data: Bytes,
     client: Arc<Client>,
-    jobs: mpsc::UnboundedSender<(PayloadBuilderAttributes, Cancel)>,
     pool: Arc<Pool>,
     bundle_pool: Arc<Mutex<BundlePool>>,
     incoming: broadcast::Sender<(BundleId, BlockNumber, BundleCompact)>,
     invalidated: broadcast::Sender<BundleId>,
+    jobs: mpsc::UnboundedSender<(PayloadBuilderAttributes, Cancel)>,
 }
 
 impl<Client, Pool> Builder<Client, Pool>
@@ -439,8 +439,8 @@ where
         config: BuilderConfig,
         chain: ChainSpec,
         client: Client,
-        jobs: mpsc::UnboundedSender<(PayloadBuilderAttributes, Cancel)>,
         pool: Pool,
+        jobs: mpsc::UnboundedSender<(PayloadBuilderAttributes, Cancel)>,
     ) -> Self {
         let chain = Arc::new(chain);
         let client = Arc::new(client);

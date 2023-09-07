@@ -11,7 +11,7 @@ use beacon_api_client::mainnet::Client as BeaconClient;
 use clap::Parser;
 use ethereum_consensus::{
     capella::mainnet::ExecutionPayload,
-    clock,
+    clock::{self, Clock, SystemTimeProvider},
     configs::mainnet::SECONDS_PER_SLOT,
     crypto::SecretKey,
     phase0::mainnet::SLOTS_PER_EPOCH,
@@ -82,9 +82,6 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
         Pool: reth::transaction_pool::TransactionPool + Unpin + 'static,
         Tasks: reth::tasks::TaskSpawner + Clone + Unpin + 'static,
     {
-        // NOTE: only allow sepolia
-        assert_eq!(chain_spec.chain(), Chain::sepolia());
-
         // beacon client
         tracing::info!("EVA's beacon API endpoint {}", self.beacon_endpoint);
         let beacon_client = Arc::new(BeaconClient::new(self.beacon_endpoint.clone()));
@@ -94,14 +91,20 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
         let relay_client = BeaconClient::new(self.relay_endpoint.clone());
         let relay_client = Arc::new(RelayClient::new(relay_client));
 
-        // builder wallet
+        // builder extra data
         let extra_data = Bytes::from(conf.extradata().as_bytes());
+
+        // builder wallet
         let wallet = LocalWallet::from_str(&self.wallet_sk).expect("wallet secret key valid");
 
         // builder BLS key
         let bls_sk = SecretKey::try_from(self.boost_bls_sk.clone()).expect("BLS secret key valid");
         let bls_sk = Arc::new(bls_sk);
         let bls_pk = Arc::new(bls_sk.public_key());
+
+        // chain info
+        let (context, clock) = context_and_clock(&chain_spec).expect("recognized chain spec");
+        let context = Arc::new(context);
 
         tracing::info!(
             "EVA booting up...\n\textra data {}\n\texecution address {}\n\tBLS public key {}",
@@ -120,7 +123,7 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
 
         // construct and start the builder
         tracing::info!("spawning builder");
-        let build_deadline = Duration::from_secs(12);
+        let build_deadline = Duration::from_secs(SECONDS_PER_SLOT);
         let build_interval = Duration::from_millis(500);
         let config = BuilderConfig {
             extra_data,
@@ -128,7 +131,7 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
             deadline: build_deadline,
             interval: build_interval,
         };
-        let builder = Builder::new(config, chain_spec.deref().clone(), provider, jobs_tx, pool);
+        let builder = Builder::new(config, chain_spec.deref().clone(), provider, pool, jobs_tx);
         builder.start(bundles, events);
 
         // spawn payload builder service to drive payload build jobs forward
@@ -145,9 +148,6 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
             let validators = Arc::new(ValidatorRegistry::new(beacon_client.deref().clone()));
             let scheduler = Arc::new(ProposerScheduler::new(beacon_client.deref().clone()));
 
-            let context = Arc::new(Context::for_sepolia());
-            let clock = clock::for_sepolia();
-
             // refresh the consensus and mev-boost info each epoch
             let seconds_per_epoch = SECONDS_PER_SLOT * SLOTS_PER_EPOCH;
             let validator_info_refresh_interval = Duration::from_secs(seconds_per_epoch);
@@ -160,12 +160,12 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
             loop {
                 tokio::select! {
                     _ = validator_info_refresh_interval.tick() => {
-                        tracing::info!("refreshing consensus and mev-boost info");
+                        tracing::info!("refreshing consensus and mev-boost info...");
 
                         // load validators
                         tracing::info!("loading validators...");
                         if let Err(err) = validators.load().await {
-                            tracing::error!("unable to load validators {err}, quitting builder...");
+                            tracing::error!("unable to load validators {err}");
                         }
                         tracing::info!("successfully loaded validators");
 
@@ -343,6 +343,7 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                                                 signature,
                                             };
 
+                                            // submit signed bid
                                             if let Err(err) = inner_relay_client.submit_bid(&submission).await {
                                                 tracing::warn!(
                                                     slot = %payload_slot,
@@ -405,6 +406,21 @@ fn main() {
 // COMPATIBILITY
 //
 // TODO: move into separate module
+
+fn context_and_clock<T: AsRef<ChainSpec>>(
+    chain: T,
+) -> Option<(Context, Clock<SystemTimeProvider>)> {
+    let chain = chain.as_ref().chain();
+    if chain == Chain::mainnet() {
+        Some((Context::for_mainnet(), clock::for_mainnet()))
+    } else if chain == Chain::goerli() {
+        Some((Context::for_goerli(), clock::for_goerli()))
+    } else if chain == Chain::sepolia() {
+        Some((Context::for_sepolia(), clock::for_sepolia()))
+    } else {
+        None
+    }
+}
 
 fn to_bytes32(value: H256) -> Bytes32 {
     Bytes32::try_from(value.as_bytes()).unwrap()
