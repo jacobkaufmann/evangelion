@@ -121,10 +121,12 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
         // construct and start the builder
         tracing::info!("spawning builder");
         let build_deadline = Duration::from_secs(12);
+        let build_interval = Duration::from_millis(500);
         let config = BuilderConfig {
             extra_data,
             wallet,
             deadline: build_deadline,
+            interval: build_interval,
         };
         let builder = Builder::new(config, chain_spec.deref().clone(), provider, jobs_tx, pool);
         builder.start(bundles, events);
