@@ -45,6 +45,7 @@ use reth_revm::{
     },
 };
 use reth_transaction_pool::{noop::NoopTransactionPool, TransactionPool};
+use tokio::time::Interval;
 use tokio::{
     sync::{broadcast, mpsc, oneshot},
     task,
@@ -136,12 +137,17 @@ struct JobConfig {
     attributes: PayloadAttributes,
     parent: Arc<SealedHeader>,
     chain: Arc<ChainSpec>,
+    deadline: Duration,
+    interval: Duration,
 }
 
 /// a build job scoped to `config`
 pub struct Job<Client, Pool> {
-    config: JobConfig,
+    attributes: PayloadAttributes,
+    parent: Arc<SealedHeader>,
+    chain: Arc<ChainSpec>,
     deadline: Pin<Box<Sleep>>,
+    interval: Interval,
     client: Arc<Client>,
     pool: Arc<Pool>,
     bundles: HashMap<BundleId, BundleCompact>,
@@ -154,7 +160,6 @@ pub struct Job<Client, Pool> {
 impl<Client, Pool> Job<Client, Pool> {
     fn new<I: IntoIterator<Item = Bundle>>(
         config: JobConfig,
-        deadline: Pin<Box<Sleep>>,
         client: Arc<Client>,
         pool: Arc<Pool>,
         bundles: I,
@@ -168,9 +173,15 @@ impl<Client, Pool> Job<Client, Pool> {
         let built_payloads = Vec::new();
         let pending_payloads = VecDeque::new();
 
+        let deadline = Box::pin(sleep(config.deadline));
+        let interval = tokio::time::interval(config.interval);
+
         Self {
-            config,
+            attributes: config.attributes,
+            parent: config.parent,
+            chain: config.chain,
             deadline,
+            interval,
             client,
             pool,
             bundles,
@@ -190,8 +201,6 @@ where
     type Output = Result<(), PayloadBuilderError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let config = self.config.clone();
-
         let this = self.get_mut();
 
         // check whether the deadline for the job expired
@@ -206,7 +215,7 @@ where
             match incoming.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok((id, block_num, bundle)))) => {
                     // if the bundle is not eligible for the job, then skip the bundle
-                    if block_num != this.config.parent.number + 1 {
+                    if block_num != this.parent.number + 1 {
                         continue;
                     }
 
@@ -236,8 +245,12 @@ where
         this.built_payloads
             .retain(|payload| payload.bundles.is_disjoint(&expired_bundles));
 
-        // if there are any expired or new bundles, then build a new payload
-        if !expired_bundles.is_empty() || num_incoming_bundles > 0 {
+        // check the build interval
+        let interval_reached = this.interval.poll_tick(cx).is_ready();
+
+        // if there are any expired or new bundles, or the build interval was reached, then build a
+        // new payload
+        if !expired_bundles.is_empty() || num_incoming_bundles > 0 || interval_reached {
             // NOTE: here we greedily select bundles that do not "obviously conflict" with
             // previously selected bundles. you could do far more sophisticated things here.
             let mut bundles: Vec<(BundleId, BundleCompact)> = vec![];
@@ -247,11 +260,14 @@ where
                 }
             }
 
+            let attributes = this.attributes.clone();
+            let parent = Arc::clone(&this.parent);
+            let chain = Arc::clone(&this.chain);
             let client = Arc::clone(&this.client);
             let pool = Arc::clone(&this.pool);
             let pending = task::spawn_blocking(move || {
                 // TODO: come back to this
-                build(config, client, pool, bundles)
+                build(attributes, parent, chain, client, pool, bundles)
             });
 
             this.pending_payloads.push_back(pending);
@@ -326,7 +342,9 @@ where
         }
 
         let empty = build(
-            self.config.clone(),
+            self.attributes.clone(),
+            Arc::clone(&self.parent),
+            Arc::clone(&self.chain),
             Arc::clone(&self.client),
             Arc::new(NoopTransactionPool::default()),
             None,
@@ -340,11 +358,13 @@ where
         // if there is no best payload, then build an empty payload
         let empty_payload = if best_payload.is_none() {
             let (tx, rx) = oneshot::channel();
-            let config = self.config.clone();
+            let attributes = self.attributes.clone();
+            let parent = Arc::clone(&self.parent);
+            let chain = Arc::clone(&self.chain);
             let client = Arc::clone(&self.client);
             let pool = Arc::new(NoopTransactionPool::default());
             task::spawn_blocking(move || {
-                let payload = build(config, client, pool, None);
+                let payload = build(attributes, parent, chain, client, pool, None);
                 let _ = tx.send(payload);
             });
 
@@ -366,6 +386,7 @@ where
 #[derive(Clone, Debug)]
 pub struct BuilderConfig {
     pub deadline: Duration,
+    pub interval: Duration,
     pub extra_data: u128,
     pub wallet: LocalWallet,
 }
@@ -373,6 +394,7 @@ pub struct BuilderConfig {
 pub struct Builder<Client, Pool> {
     chain: Arc<ChainSpec>,
     deadline: Duration,
+    interval: Duration,
     wallet: LocalWallet,
     extra_data: u128,
     client: Arc<Client>,
@@ -400,6 +422,7 @@ where
         Self {
             chain,
             deadline: config.deadline,
+            interval: config.interval,
             wallet: config.wallet,
             extra_data: config.extra_data,
             client,
@@ -506,9 +529,9 @@ where
             attributes,
             chain: Arc::clone(&self.chain),
             parent,
+            deadline: self.deadline,
+            interval: self.interval,
         };
-
-        let deadline = Box::pin(sleep(self.deadline));
 
         // collect eligible bundles from the pool
         //
@@ -524,7 +547,6 @@ where
 
         Ok(Job::new(
             config,
-            deadline,
             Arc::clone(&self.client),
             Arc::clone(&self.pool),
             bundles,
@@ -535,7 +557,9 @@ where
 }
 
 fn build<Client, P, I>(
-    config: JobConfig,
+    attributes: PayloadAttributes,
+    parent: Arc<SealedHeader>,
+    chain: Arc<ChainSpec>,
     client: Arc<Client>,
     pool: P,
     bundles: I,
@@ -545,14 +569,16 @@ where
     P: TransactionPool,
     I: IntoIterator<Item = (BundleId, BundleCompact)>,
 {
-    let state = client.state_by_block_hash(config.parent.hash)?;
+    let state = client.state_by_block_hash(parent.hash)?;
     let state = State::new(state);
-    let unpackaged_payload = build_on_state(config, state, pool, bundles)?;
+    let unpackaged_payload = build_on_state(attributes, parent, chain, state, pool, bundles)?;
     unpackaged_payload.package()
 }
 
 fn build_on_state<S, P, I>(
-    config: JobConfig,
+    attributes: PayloadAttributes,
+    parent: Arc<SealedHeader>,
+    chain: Arc<ChainSpec>,
     state: State<S>,
     pool: P,
     bundles: I,
@@ -567,13 +593,10 @@ where
 
     let mut post_state = PostState::default();
 
-    let (cfg_env, mut block_env) = config
-        .attributes
-        .inner
-        .cfg_and_block_env(&config.chain, &config.parent);
+    let (cfg_env, mut block_env) = attributes.inner.cfg_and_block_env(&chain, &parent);
 
     // mark the builder as the coinbase in the block env
-    block_env.coinbase = config.attributes.wallet.address().into();
+    block_env.coinbase = attributes.wallet.address().into();
 
     let block_num = block_env.number.to::<u64>();
     let base_fee = block_env.basefee.to::<u64>();
@@ -684,11 +707,11 @@ where
             .basic(block_env.coinbase)?
             .expect("builder account exists if coinbase payment non-zero");
         let payment_tx = proposer_payment_tx(
-            &config.attributes.wallet,
+            &attributes.wallet,
             builder_acct.nonce,
             base_fee,
             cfg_env.chain_id.to::<u64>(),
-            &config.attributes.inner.suggested_fee_recipient,
+            &attributes.inner.suggested_fee_recipient,
             proposer_payment,
         );
 
@@ -710,20 +733,20 @@ where
 
     // NOTE: here we assume post-shanghai
     let balance_increments = post_block_withdrawals_balance_increments(
-        &config.chain,
-        config.attributes.inner.timestamp,
-        &config.attributes.inner.withdrawals,
+        &chain,
+        attributes.inner.timestamp,
+        &attributes.inner.withdrawals,
     );
     for (address, increment) in balance_increments {
         increment_account_balance(&mut db, &mut post_state, block_num, address, increment)?;
     }
 
     Ok(UnpackagedPayload {
-        attributes: config.attributes.inner,
+        attributes: attributes.inner,
         block_env,
         state,
         post_state,
-        extra_data: config.attributes.extra_data,
+        extra_data: attributes.extra_data,
         txs: txs.into_iter().map(|tx| tx.into_signed()).collect(),
         bundles: bundle_ids,
         cumulative_gas_used,
