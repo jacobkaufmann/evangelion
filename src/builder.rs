@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::matches;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{self, AtomicBool},
+    Arc, Mutex,
+};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -59,7 +62,7 @@ struct UnpackagedPayload<S: StateProvider> {
     block_env: BlockEnv,
     state: Arc<State<S>>,
     post_state: PostState,
-    extra_data: u128,
+    extra_data: Bytes,
     txs: Vec<TransactionSigned>,
     bundles: HashSet<BundleId>,
     cumulative_gas_used: u64,
@@ -98,8 +101,8 @@ impl<S: StateProvider> UnpackagedPayload<S> {
             base_fee_per_gas: Some(base_fee),
             blob_gas_used: None,
             excess_blob_gas: None,
+            extra_data: self.extra_data,
             parent_beacon_block_root: None,
-            extra_data: self.extra_data.to_le_bytes().into(),
         };
 
         let block = Block {
@@ -128,7 +131,7 @@ struct Payload {
 #[derive(Clone, Debug)]
 struct PayloadAttributes {
     inner: PayloadBuilderAttributes,
-    extra_data: u128,
+    extra_data: Bytes,
     wallet: LocalWallet,
 }
 
@@ -141,6 +144,19 @@ struct JobConfig {
     interval: Duration,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub fn cancel(&self) {
+        self.0.store(true, atomic::Ordering::Relaxed)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(atomic::Ordering::Relaxed)
+    }
+}
+
 /// a build job scoped to `config`
 pub struct Job<Client, Pool> {
     attributes: PayloadAttributes,
@@ -148,6 +164,7 @@ pub struct Job<Client, Pool> {
     chain: Arc<ChainSpec>,
     deadline: Pin<Box<Sleep>>,
     interval: Interval,
+    cancel: Cancel,
     client: Arc<Client>,
     pool: Arc<Pool>,
     bundles: HashMap<BundleId, BundleCompact>,
@@ -160,6 +177,7 @@ pub struct Job<Client, Pool> {
 impl<Client, Pool> Job<Client, Pool> {
     fn new<I: IntoIterator<Item = Bundle>>(
         config: JobConfig,
+        cancel: Cancel,
         client: Arc<Client>,
         pool: Arc<Pool>,
         bundles: I,
@@ -182,6 +200,7 @@ impl<Client, Pool> Job<Client, Pool> {
             chain: config.chain,
             deadline,
             interval,
+            cancel,
             client,
             pool,
             bundles,
@@ -202,6 +221,11 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+
+        // check whether the job was cancelled
+        if this.cancel.is_cancelled() {
+            return Poll::Ready(Ok(()));
+        }
 
         // check whether the deadline for the job expired
         if this.deadline.as_mut().poll(cx).is_ready() {
@@ -274,6 +298,7 @@ where
         }
 
         // poll all pending payloads
+        let payload_id = this.attributes.inner.payload_id();
         while let Some(mut pending) = this.pending_payloads.pop_front() {
             match pending.poll_unpin(cx) {
                 Poll::Ready(payload) => {
@@ -282,11 +307,11 @@ where
                             // cache the built payload
                             this.built_payloads.push(payload);
                         }
-                        Ok(Err(..)) => {
-                            // build task failed
+                        Ok(Err(err)) => {
+                            tracing::warn!(payload = %payload_id, "payload build failed {err}")
                         }
-                        Err(..) => {
-                            // `recv` failed
+                        Err(err) => {
+                            tracing::error!(payload = %payload_id, "payload task failed to complete {err}")
                         }
                     }
                 }
@@ -387,7 +412,7 @@ where
 pub struct BuilderConfig {
     pub deadline: Duration,
     pub interval: Duration,
-    pub extra_data: u128,
+    pub extra_data: Bytes,
     pub wallet: LocalWallet,
 }
 
@@ -396,12 +421,13 @@ pub struct Builder<Client, Pool> {
     deadline: Duration,
     interval: Duration,
     wallet: LocalWallet,
-    extra_data: u128,
+    extra_data: Bytes,
     client: Arc<Client>,
     pool: Arc<Pool>,
     bundle_pool: Arc<Mutex<BundlePool>>,
     incoming: broadcast::Sender<(BundleId, BlockNumber, BundleCompact)>,
     invalidated: broadcast::Sender<BundleId>,
+    jobs: mpsc::UnboundedSender<(PayloadBuilderAttributes, Cancel)>,
 }
 
 impl<Client, Pool> Builder<Client, Pool>
@@ -409,7 +435,13 @@ where
     Client: StateProviderFactory + Unpin,
     Pool: TransactionPool + Unpin,
 {
-    pub fn new(config: BuilderConfig, chain: ChainSpec, client: Client, pool: Pool) -> Self {
+    pub fn new(
+        config: BuilderConfig,
+        chain: ChainSpec,
+        client: Client,
+        pool: Pool,
+        jobs: mpsc::UnboundedSender<(PayloadBuilderAttributes, Cancel)>,
+    ) -> Self {
         let chain = Arc::new(chain);
         let client = Arc::new(client);
         let pool = Arc::new(pool);
@@ -426,6 +458,7 @@ where
             wallet: config.wallet,
             extra_data: config.extra_data,
             client,
+            jobs,
             pool,
             bundle_pool,
             incoming,
@@ -520,7 +553,7 @@ where
 
         let attributes = PayloadAttributes {
             inner: attributes,
-            extra_data: self.extra_data,
+            extra_data: self.extra_data.clone(),
             wallet: self.wallet.clone(),
         };
 
@@ -532,6 +565,8 @@ where
             deadline: self.deadline,
             interval: self.interval,
         };
+
+        let cancel = Cancel::default();
 
         // collect eligible bundles from the pool
         //
@@ -545,8 +580,14 @@ where
         let incoming = BroadcastStream::new(self.incoming.subscribe()).fuse();
         let invalidated = BroadcastStream::new(self.invalidated.subscribe()).fuse();
 
+        // alert about new payload job
+        let _ = self
+            .jobs
+            .send((config.attributes.inner.clone(), cancel.clone()));
+
         Ok(Job::new(
             config,
+            cancel,
             Arc::clone(&self.client),
             Arc::clone(&self.pool),
             bundles,
