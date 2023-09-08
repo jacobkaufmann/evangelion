@@ -10,6 +10,7 @@ ethereum-consensus = { git = "https://github.com/ralexstokes/ethereum-consensus"
 ethers = "2.0.8"
 eyre = "0.6.8"
 futures-util = "0.3.28"
+jsonrpsee = { version = "0.20.0", features = ["macros", "server"] }
 mev-rs = { git = "https://github.com/ralexstokes/mev-rs", rev = "db54c2d", features = ["serde"] }
 rand = "0.8.5"
 reth = { git = "https://github.com/paradigmxyz/reth.git", package = "reth", version = "0.1.0-alpha.8" }
@@ -19,6 +20,7 @@ reth-primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "
 reth-provider = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-provider", version = "0.1.0-alpha.8" }
 reth-revm = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm", version = "0.1.0-alpha.8" }
 reth-revm-primitives = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-revm-primitives", version = "0.1.0-alpha.8" }
+reth-rpc = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-rpc", version = "0.1.0-alpha.8" }
 reth-rpc-types = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-rpc-types", version = "0.1.0-alpha.8" }
 reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth.git", package = "reth-transaction-pool", version = "0.1.0-alpha.8" }
 serde = { version = "1.0.187", features = ["std", "derive"] }
