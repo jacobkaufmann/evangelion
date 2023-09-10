@@ -36,7 +36,7 @@ where
         let tx = tx
             .into_ecrecovered()
             .ok_or(EthApiError::InvalidTransactionSignature)?;
-        let tx = <Pool::Transaction>::from_recovered_transaction(tx.into());
+        let tx = <Pool::Transaction>::from_recovered_transaction(tx);
         let hash = self
             .pool
             .add_transaction(TransactionOrigin::Private, tx)
