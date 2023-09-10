@@ -166,16 +166,18 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                         tracing::info!("loading validators...");
                         if let Err(err) = validators.load().await {
                             tracing::error!("unable to load validators {err}");
+                        } else {
+                            tracing::info!("successfully loaded validators");
                         }
-                        tracing::info!("successfully loaded validators");
 
                         // retrieve proposer duties for the current epoch
                         tracing::info!("retrieving proposer duties...");
                         let epoch = clock.current_epoch().expect("beyond genesis");
                         if let Err(err) = scheduler.fetch_duties(epoch).await {
                             tracing::error!("unable to retrieve proposer duties {err}");
+                        } else {
+                            tracing::info!("successfully retrieved proposer duties");
                         }
-                        tracing::info!("successfully retrieved proposer duties");
 
                         // retrieve proposer schedule from relay and validate registrations
                         tracing::info!("retrieving proposer schedule...");
