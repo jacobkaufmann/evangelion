@@ -1,5 +1,6 @@
 mod builder;
 mod bundle;
+mod rpc;
 
 use std::collections::HashSet;
 use std::ops::Deref;
@@ -27,16 +28,27 @@ use mev_rs::{
     types::{BidTrace, SignedBidSubmission},
     ProposerScheduler, ValidatorRegistry,
 };
-use reth::cli::{
-    config::PayloadBuilderConfig,
-    ext::{RethCliExt, RethNodeCommandConfig},
-    Cli,
+use reth::{
+    cli::config::RethRpcConfig,
+    cli::{
+        config::PayloadBuilderConfig,
+        ext::{RethCliExt, RethNodeCommandConfig},
+        Cli,
+    },
+    network::{NetworkInfo, Peers},
+    rpc::builder::{RethModuleRegistry, TransportRpcModules},
+    tasks::TaskSpawner,
 };
 use reth_payload_builder::{
     BuiltPayload, PayloadBuilderAttributes, PayloadBuilderHandle, PayloadBuilderService,
 };
 use reth_primitives::{Bloom, Bytes, Chain, ChainSpec, SealedBlock, H160, H256, U256};
+use reth_provider::{
+    BlockReaderIdExt, CanonStateSubscriptions, ChainSpecProvider, ChangeSetReader, EvmEnvProvider,
+    StateProviderFactory,
+};
 use reth_rpc_types::engine::PayloadAttributes;
+use reth_transaction_pool::TransactionPool;
 use ssz_rs::prelude::*;
 use tokio::{
     sync::mpsc,
@@ -46,6 +58,7 @@ use tokio_util::time::DelayQueue;
 use url::Url;
 
 use builder::{Builder, BuilderConfig};
+use rpc::{EthExt, EthExtApiServer};
 
 #[derive(Debug, Clone, clap::Args)]
 struct EvaRethNodeCommandExt {
@@ -64,6 +77,33 @@ struct EvaRethNodeCommandExt {
 }
 
 impl RethNodeCommandConfig for EvaRethNodeCommandExt {
+    fn extend_rpc_modules<Conf, Provider, Pool, Network, Tasks, Events>(
+        &mut self,
+        _config: &Conf,
+        registry: &mut RethModuleRegistry<Provider, Pool, Network, Tasks, Events>,
+        modules: &mut TransportRpcModules<()>,
+    ) -> eyre::Result<()>
+    where
+        Conf: RethRpcConfig,
+        Provider: BlockReaderIdExt
+            + StateProviderFactory
+            + EvmEnvProvider
+            + ChainSpecProvider
+            + ChangeSetReader
+            + Clone
+            + Unpin
+            + 'static,
+        Pool: TransactionPool + Clone + 'static,
+        Network: NetworkInfo + Peers + Clone + 'static,
+        Tasks: TaskSpawner + Clone + 'static,
+        Events: CanonStateSubscriptions + Clone + 'static,
+    {
+        let ext = EthExt::new(registry.pool().clone());
+        modules.merge_configured(ext.into_rpc())?;
+
+        Ok(())
+    }
+
     fn spawn_payload_builder_service<Conf, Provider, Pool, Tasks>(
         &mut self,
         conf: &Conf,
@@ -74,13 +114,9 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
     ) -> eyre::Result<PayloadBuilderHandle>
     where
         Conf: PayloadBuilderConfig,
-        Provider: reth_provider::StateProviderFactory
-            + reth_provider::BlockReaderIdExt
-            + Clone
-            + Unpin
-            + 'static,
-        Pool: reth::transaction_pool::TransactionPool + Unpin + 'static,
-        Tasks: reth::tasks::TaskSpawner + Clone + Unpin + 'static,
+        Provider: StateProviderFactory + BlockReaderIdExt + Clone + Unpin + 'static,
+        Pool: TransactionPool + Unpin + 'static,
+        Tasks: TaskSpawner + Clone + Unpin + 'static,
     {
         // beacon client
         tracing::info!("EVA's beacon API endpoint {}", self.beacon_endpoint);
