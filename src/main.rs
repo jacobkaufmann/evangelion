@@ -193,8 +193,16 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
             let mut initiated_jobs = HashSet::new();
             let mut jobs_removal_queue = DelayQueue::new();
 
+            // keep track of the current slot
+            let mut current_slot = clock.current_slot().expect("beyond genesis");
+            let slots = clock.stream_slots();
+            tokio::pin!(slots);
+
             loop {
                 tokio::select! {
+                    Some(slot) = slots.next() => {
+                        current_slot = slot;
+                    }
                     _ = validator_info_refresh_interval.tick() => {
                         tracing::info!("refreshing consensus and mev-boost info...");
 
@@ -235,12 +243,13 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                     }
                     Some((mut attrs, cancel)) = jobs_rx.recv() => {
                         let mut payload_id = attrs.id;
-                        let payload_slot = clock.slot_at_time(attrs.timestamp).expect("beyond genesis");
 
                         // if this is a job we initiated below, then move on
                         if initiated_jobs.contains(&payload_id) {
                             continue;
                         }
+
+                        let payload_slot = clock.slot_at_time(attrs.timestamp).expect("beyond genesis");
 
                         // cancel the job, since we only want to keep jobs that we initiated
                         tracing::debug!(
@@ -249,6 +258,12 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                             "cancelling non-mev-boost payload job"
                         );
                         cancel.cancel();
+
+                        // if the payload attributes are for a slot prior to the current slot, then
+                        // do not attempt to create a new job
+                        if payload_slot < current_slot {
+                            continue;
+                        }
 
                         // look up the proposer preferences for the slot if available
                         let proposer = match scheduler.get_proposer_for(payload_slot) {
