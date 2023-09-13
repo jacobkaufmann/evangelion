@@ -802,6 +802,7 @@ where
 
 #[derive(Clone, Debug)]
 struct Execution {
+    #[allow(dead_code)]
     access_list: AccessList,
     cumulative_gas_used: u64,
     coinbase_payment: U256,
