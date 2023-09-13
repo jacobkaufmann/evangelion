@@ -297,48 +297,48 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
 
                         // TODO: pass gas limit to builder somehow
 
-                        // if the fee recipient in the payload attributes does not match the
-                        // registration, then initiate a new payload build job with the proper fee
+                        // if the fee recipient in the payload attributes does not match the one
+                        // in the registration, then update the attributes with the proper fee
                         // recipient
-                        let preferred_fee_recipient = H160::from_slice(prefs.fee_recipient.as_slice());
-                        if attrs.suggested_fee_recipient != preferred_fee_recipient {
+                        let boost_fee_recipient = H160::from_slice(prefs.fee_recipient.as_slice());
+                        if attrs.suggested_fee_recipient != boost_fee_recipient {
                             let attributes = PayloadAttributes {
                                 timestamp: attrs.timestamp.into(),
                                 prev_randao: attrs.prev_randao,
-                                suggested_fee_recipient: preferred_fee_recipient,
+                                suggested_fee_recipient: boost_fee_recipient,
                                 withdrawals: Some(attrs.withdrawals.clone()),
                                 parent_beacon_block_root: None,
                             };
                             attrs = PayloadBuilderAttributes::new(attrs.parent, attributes);
                             payload_id = attrs.payload_id();
-
-                            // if we already initiated a job with identical attributes, then move on
-                            if initiated_jobs.contains(&payload_id) {
-                                continue;
-                            }
-
-                            if let Err(err) = other_payload_builder.new_payload(attrs.clone()).await {
-                                tracing::error!(
-                                    slot = %payload_slot,
-                                    "unable to initiate new payload job {err}, not bidding for slot"
-                                );
-                                continue;
-                            }
-
-                            initiated_jobs.insert(payload_id);
-                            jobs_removal_queue.insert(payload_id, Duration::from_secs(60));
-                            tracing::info!(
-                                slot = %payload_slot,
-                                proposer = %proposer,
-                                payload = %payload_id,
-                                "successfully initiated new payload job for mev-boost auction"
-                            );
                         }
+
+                        // if we already initiated a job with identical attributes, then move on
+                        if initiated_jobs.contains(&payload_id) {
+                            continue;
+                        }
+
+                        // initiate the new payload job
+                        if let Err(err) = other_payload_builder.new_payload(attrs).await {
+                            tracing::error!(
+                                slot = %payload_slot,
+                                "unable to initiate new payload job {err}, not bidding for slot"
+                            );
+                            continue;
+                        }
+
+                        initiated_jobs.insert(payload_id);
+                        jobs_removal_queue.insert(payload_id, Duration::from_secs(60));
+                        tracing::info!(
+                            slot = %payload_slot,
+                            proposer = %proposer,
+                            payload = %payload_id,
+                            "successfully initiated new payload job for mev-boost auction"
+                        );
 
                         // spawn a task to periodically poll the payload job and submit bids to the
                         // mev-boost relay
                         let proposer = Arc::new(proposer);
-                        let proposer_fee_recipient = attrs.suggested_fee_recipient;
                         let inner_payload_builder = other_payload_builder.clone();
                         let inner_relay_client = Arc::clone(&relay_client);
                         let inner_bls_pk = Arc::clone(&bls_pk);
@@ -382,7 +382,7 @@ impl RethNodeCommandConfig for EvaRethNodeCommandExt {
                                                 payload_slot,
                                                 inner_bls_pk.clone(),
                                                 proposer.clone(),
-                                                to_bytes20(proposer_fee_recipient)
+                                                to_bytes20(boost_fee_recipient)
                                             );
                                             let execution_payload = block_to_execution_payload(payload.block());
                                             let signature = sign_builder_message(
