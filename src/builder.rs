@@ -30,9 +30,8 @@ use reth_payload_builder::{
 use reth_primitives::AccessListItem;
 use reth_primitives::{
     constants::{BEACON_NONCE, EMPTY_OMMER_ROOT},
-    proofs, AccessList, Address, Block, BlockNumber, Bytes, ChainSpec, Header,
-    IntoRecoveredTransaction, Receipt, SealedHeader, TransactionSigned,
-    TransactionSignedEcRecovered, U256,
+    proofs, AccessList, Block, BlockNumber, Bytes, ChainSpec, Header, IntoRecoveredTransaction,
+    Receipt, SealedHeader, TransactionSigned, TransactionSignedEcRecovered, U256,
 };
 use reth_provider::{
     BlockReaderIdExt, CanonStateNotification, PostState, StateProvider, StateProviderFactory,
@@ -941,12 +940,8 @@ fn proposer_payment_tx(
     tx.into_ecrecovered().expect("can recover tx signer")
 }
 
-fn precompiles(cfg_env: &CfgEnv) -> HashSet<Address> {
+fn precompiles(cfg_env: &CfgEnv) -> &Precompiles {
     Precompiles::new(PrecompileSpecId::from_spec_id(cfg_env.spec_id))
-        .addresses()
-        .into_iter()
-        .map(Address::from)
-        .collect()
 }
 
 #[cfg(test)]
