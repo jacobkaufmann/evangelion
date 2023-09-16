@@ -15,7 +15,8 @@ use ethers::{
     signers::{LocalWallet, Signer},
     types::{
         transaction::{
-            eip1559::Eip1559TransactionRequest, eip2718::TypedTransaction, eip2930::AccessList,
+            eip1559::Eip1559TransactionRequest, eip2718::TypedTransaction,
+            eip2930::AccessList as EthersAccessList,
         },
         Bytes as EthersBytes, NameOrAddress,
     },
@@ -26,15 +27,17 @@ use reth_payload_builder::{
     error::PayloadBuilderError, BuiltPayload, KeepPayloadJobAlive, PayloadBuilderAttributes,
     PayloadJob, PayloadJobGenerator,
 };
+use reth_primitives::AccessListItem;
 use reth_primitives::{
     constants::{BEACON_NONCE, EMPTY_OMMER_ROOT},
-    proofs, Block, BlockNumber, Bytes, ChainSpec, Header, IntoRecoveredTransaction, Receipt,
-    SealedHeader, TransactionSigned, TransactionSignedEcRecovered, U256,
+    proofs, AccessList, Block, BlockNumber, Bytes, ChainSpec, Header, IntoRecoveredTransaction,
+    Receipt, SealedHeader, TransactionSigned, TransactionSignedEcRecovered, U256,
 };
 use reth_provider::{
     BlockReaderIdExt, CanonStateNotification, PostState, StateProvider, StateProviderFactory,
 };
 use reth_revm::{
+    access_list::AccessListInspector,
     database::State,
     env::tx_env_with_recovered,
     executor::{
@@ -43,6 +46,7 @@ use reth_revm::{
     into_reth_log,
     revm::{
         db::{CacheDB, DatabaseRef},
+        precompile::{Precompiles, SpecId as PrecompileSpecId},
         primitives::{BlockEnv, CfgEnv, EVMError, Env, InvalidTransaction, ResultAndState, B160},
         EVM,
     },
@@ -797,6 +801,8 @@ where
 
 #[derive(Clone, Debug)]
 struct Execution {
+    #[allow(dead_code)]
+    access_list: AccessList,
     cumulative_gas_used: u64,
     coinbase_payment: U256,
 }
@@ -815,6 +821,12 @@ where
 {
     let block_num = block_env.number.to::<u64>();
 
+    // NOTE: the `AccessListInspector` does not always include the `from` (i.e. sender) and `to`
+    // (i.e. recipient) for a transaction, so we ensure that those values are included
+    let mut access_list_base = vec![];
+
+    let mut inspector = AccessListInspector::default();
+
     // determine the initial balance of the account at the coinbase address
     let coinbase_acct = db.basic(block_env.coinbase).map_err(EVMError::Database)?;
     let initial_coinbase_balance = coinbase_acct.map_or(U256::ZERO, |acct| acct.balance);
@@ -831,7 +843,7 @@ where
         evm.database(&mut *db);
 
         // execute transaction
-        let ResultAndState { result, state } = evm.transact()?;
+        let ResultAndState { result, state } = evm.inspect(&mut inspector)?;
 
         // commit changes to DB and post state
         commit_state_changes(db, post_state, block_num, state, true);
@@ -847,13 +859,35 @@ where
                 logs: result.logs().into_iter().map(into_reth_log).collect(),
             },
         );
+
+        // add the `from` and `to` values for the transaction to the access list
+        access_list_base.push(AccessListItem {
+            address: tx.signer(),
+            ..Default::default()
+        });
+        if let Some(to) = tx.to() {
+            access_list_base.push(AccessListItem {
+                address: to,
+                ..Default::default()
+            });
+        }
     }
 
-    // compute the coinbase payment
+    // remove any precompiles from access list
+    let mut access_list = inspector.into_access_list();
+    let precompiles = precompiles(cfg_env);
+    access_list
+        .0
+        .retain(|item| !precompiles.contains(&item.address));
+
+    // ensure that all callers and recipients are included in the access list
+    access_list.0.append(&mut access_list_base);
+
     let coinbase_payment =
         compute_coinbase_payment(&block_env.coinbase, initial_coinbase_balance, post_state);
 
     Ok(Execution {
+        access_list,
         cumulative_gas_used,
         coinbase_payment,
     })
@@ -895,7 +929,7 @@ fn proposer_payment_tx(
         .max_priority_fee_per_gas(0)
         .value(amount)
         .data(EthersBytes::default())
-        .access_list(AccessList::default())
+        .access_list(EthersAccessList::default())
         .nonce(nonce)
         .chain_id(chain_id);
     let tx = TypedTransaction::Eip1559(tx);
@@ -906,16 +940,17 @@ fn proposer_payment_tx(
     tx.into_ecrecovered().expect("can recover tx signer")
 }
 
+fn precompiles(cfg_env: &CfgEnv) -> &Precompiles {
+    Precompiles::new(PrecompileSpecId::from_spec_id(cfg_env.spec_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use ethers::{
         signers::{LocalWallet, Signer},
-        types::{
-            transaction::eip2718::TypedTransaction, Eip1559TransactionRequest, NameOrAddress,
-            H160 as EthersAddress,
-        },
+        types::{Eip1559TransactionRequest, NameOrAddress, H160 as EthersAddress},
     };
     use reth_primitives::{Address, Bytes, TxType};
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
@@ -1017,6 +1052,7 @@ mod tests {
         )
         .expect("execution doesn't fail");
         let Execution {
+            access_list,
             cumulative_gas_used,
             coinbase_payment,
         } = execution;
@@ -1048,6 +1084,12 @@ mod tests {
             .expect("receiver account touched")
             .expect("receiver account not destroyed");
         assert_eq!(receiver_account.balance, U256::from(transfer_amount));
+
+        // check access list
+        let access_list_addrs: HashSet<_> =
+            access_list.0.into_iter().map(|item| item.address).collect();
+        assert!(access_list_addrs.contains(&Address::from(sender_wallet.address())));
+        assert!(access_list_addrs.contains(&Address::from(receiver_wallet.address())));
 
         // check gas usage
         assert_eq!(cumulative_gas_used, expected_cumulative_gas_used);
@@ -1119,9 +1161,16 @@ mod tests {
         )
         .expect("execution doesn't fail");
         let Execution {
+            access_list,
             coinbase_payment,
             cumulative_gas_used,
         } = execution;
+
+        // check access list
+        let access_list_addrs: HashSet<_> =
+            access_list.0.into_iter().map(|item| item.address).collect();
+        assert!(access_list_addrs.contains(&Address::from(sender_wallet.address())));
+        assert!(access_list_addrs.contains(&Address::from(contract_addr)));
 
         // check coinbase payment
         let expected_coinbase_payment = tx_value + (cumulative_gas_used * max_priority_fee);
